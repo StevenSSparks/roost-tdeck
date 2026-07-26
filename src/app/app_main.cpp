@@ -277,7 +277,7 @@ void setup() {
   aiColor   = C_TEAL;     // configurable
 
   drawSplash();
-  delay(1600);
+  delay(3500);   // linger so the splash is enjoyable / photographable (Settings option later)
 
   int save = chatFontIdx; chatFontIdx = 0;   // boot in tiny so startup lines fit
   addMsg("Booting... connecting WiFi", C_DIM); draw();
