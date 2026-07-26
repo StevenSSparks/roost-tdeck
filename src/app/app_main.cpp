@@ -54,6 +54,12 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 #ifndef GEOAPIFY_KEY
 #define GEOAPIFY_KEY ""
 #endif
+#ifndef SSH_USER
+#define SSH_USER "roost"
+#endif
+#ifndef SSH_PASS
+#define SSH_PASS "roostos"
+#endif
 #ifndef ANTHROPIC_API_KEY
 #define ANTHROPIC_API_KEY ""
 #endif
@@ -67,7 +73,7 @@ static const char* PROVIDERS[] = {"anthropic", "openai", "gemini", "ollama"};
 static const int NPROV = 4;
 static String defaultModel(const String& p) {
   if (p == "openai") return "gpt-4o-mini";
-  if (p == "gemini") return "gemini-2.0-flash-lite";   // small/cheap (demo key)
+  if (p == "gemini") return "gemini-flash-lite-latest";   // cheap alias, won't go stale
   if (p == "ollama") return "llama3.2";
   return "claude-haiku-4-5";
 }
@@ -108,7 +114,8 @@ static void setFont(int idx) {
 // ---- configurable state (future Settings) ----
 static int chatFontIdx  = 1;   // message text size (default small = FreeSans 9pt)
 static int inputFontIdx = 1;   // input-box text size (default small)
-static uint16_t userColor, aiColor;   // set in setup(); configurable
+static uint16_t userColor, aiColor, accentColor;   // set in setup(); configurable
+static String  youLabel = "You";      // chat label for your own messages (name/initials)
 static int splashMs   = 3500;  // boot splash duration
 static int scrollStep = 2;     // lines per trackball detent (adjustable "rate")
 static String aiProvider = DEFAULT_AI_PROVIDER;   // anthropic|openai|gemini|ollama
@@ -122,8 +129,13 @@ static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
 static bool    webSearchOn = false;                // allow AI web search (roadmap)
 static bool    remoteShellOn = false;              // TCP shell on port 23
-static bool    sshOn = false;                      // real SSH server on port 22
-static String  sshUser = "roost", sshPass = "roostos";   // SSH login
+// Status-bar mode: IP = SSID+IP; DEMO = masked ("Demo") for photos; PHONE = wifi
+// bars + battery + clock (no SSID/IP). Each renders differently.
+enum { STAT_IP, STAT_DEMO, STAT_PHONE };
+static int     statusMode = STAT_IP;
+// SSH: default ON only if creds were configured in secrets; else off (safe default).
+static bool    sshOn = (SSH_USER[0] != '\0' && SSH_PASS[0] != '\0');
+static String  sshUser = SSH_USER, sshPass = SSH_PASS;   // SSH login (from secrets, editable)
 static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 // WiFi override set on-device (empty => fall back to secrets.h DEFAULT_WIFI_*)
 static String  wifiSsid = "", wifiPass = "";
@@ -133,6 +145,9 @@ static double  locLat = 0, locLon = 0; static bool locValid = false;
 static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
 // last map shown (persisted) so /map can reopen it without a GPS fix
 static double  lastMapLat = 0, lastMapLon = 0; static bool lastMapValid = false;
+// touch calibration: screen = affine(raw). Defaults to identity (uncalibrated).
+static float   tcAx = 1, tcBx = 0, tcCx = 0, tcAy = 0, tcBy = 1, tcCy = 0;
+static bool    touchCalValid = false;
 static TinyGPSPlus gps;
 static HardwareSerial GPSser(1);
 // TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
@@ -148,12 +163,31 @@ static void applyBrightness() {
   if (!init) { ledcSetup(0, 5000, 8); ledcAttachPin(PIN_BL, 0); init = true; }
   ledcWrite(0, constrain(brightness, 8, 255));
 }
+// Network name for display — masked to "Demo" when demo mode is on (for photos).
+static String dispSsid() { return statusMode != STAT_IP ? String("Demo") : WiFi.SSID(); }
+static const char* statusName() { return statusMode == STAT_IP ? "IP" : statusMode == STAT_DEMO ? "Demo" : "Phone"; }
+// battery percent from the GPIO4 ADC (board divider ~x2; 3.3V=0%, 4.2V=100%)
+static int batteryPct() {
+  uint32_t mv = analogReadMilliVolts(4) * 2;
+  int pct = (int)(((long)mv - 3300) * 100 / (4200 - 3300));
+  return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+}
+// Approximate charging detection: on USB the pack reads high (no dedicated pin).
+static bool batteryCharging() { return analogReadMilliVolts(4) * 2 > 4250; }
+// wifi signal level 0..4 from RSSI
+static int wifiLevel() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  int r = WiFi.RSSI();
+  return r > -55 ? 4 : r > -65 ? 3 : r > -72 ? 2 : r > -82 ? 1 : 0;
+}
 
 static void saveCfg() {
   prefs.begin("roostcomm", false);
   prefs.putInt("chatFont", chatFontIdx);
   prefs.putInt("inputFont", inputFontIdx);
   prefs.putUShort("userCol", userColor);
+  prefs.putUShort("accentCol", accentColor);
+  prefs.putString("youLabel", youLabel);
   prefs.putUShort("aiCol", aiColor);
   prefs.putInt("splashMs", splashMs);
   prefs.putInt("scrollStep", scrollStep);
@@ -173,12 +207,16 @@ static void saveCfg() {
   prefs.putString("kOai", kOpenAI);
   prefs.putString("kGem", kGemini);
   prefs.putString("olHost", ollamaHost);
+  prefs.putInt("statMode", statusMode);
   prefs.putBool("sshOn", sshOn);
   prefs.putString("sshUser", sshUser);
   prefs.putString("sshPass", sshPass);
   prefs.putDouble("mapLat", lastMapLat);
   prefs.putDouble("mapLon", lastMapLon);
   prefs.putBool("mapVal", lastMapValid);
+  prefs.putBool("tcVal2", touchCalValid);
+  prefs.putFloat("tcAx", tcAx); prefs.putFloat("tcBx", tcBx); prefs.putFloat("tcCx", tcCx);
+  prefs.putFloat("tcAy", tcAy); prefs.putFloat("tcBy", tcBy); prefs.putFloat("tcCy", tcCy);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -186,6 +224,8 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   chatFontIdx  = prefs.getInt("chatFont", chatFontIdx);
   inputFontIdx = prefs.getInt("inputFont", inputFontIdx);
   userColor    = prefs.getUShort("userCol", userColor);
+  accentColor  = prefs.getUShort("accentCol", accentColor);
+  youLabel     = prefs.getString("youLabel", youLabel);
   aiColor      = prefs.getUShort("aiCol", aiColor);
   splashMs     = prefs.getInt("splashMs", splashMs);
   scrollStep   = prefs.getInt("scrollStep", scrollStep);
@@ -205,12 +245,18 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   kOpenAI      = prefs.getString("kOai", kOpenAI);
   kGemini      = prefs.getString("kGem", kGemini);
   ollamaHost   = prefs.getString("olHost", ollamaHost);
+  statusMode   = prefs.getInt("statMode", statusMode);
   sshOn        = prefs.getBool("sshOn", sshOn);
   sshUser      = prefs.getString("sshUser", sshUser);
   sshPass      = prefs.getString("sshPass", sshPass);
   lastMapLat   = prefs.getDouble("mapLat", 0);
   lastMapLon   = prefs.getDouble("mapLon", 0);
   lastMapValid = prefs.getBool("mapVal", false);
+  touchCalValid = prefs.getBool("tcVal2", false);
+  if (touchCalValid) {
+    tcAx = prefs.getFloat("tcAx", 1); tcBx = prefs.getFloat("tcBx", 0); tcCx = prefs.getFloat("tcCx", 0);
+    tcAy = prefs.getFloat("tcAy", 0); tcBy = prefs.getFloat("tcBy", 1); tcCy = prefs.getFloat("tcCy", 0);
+  }
   prefs.end();
 }
 
@@ -226,20 +272,28 @@ static uint16_t namedColor(const String& n) {
   if (n == "cyan")    return tft.color565(0x4d, 0xe6, 0xff);
   if (n == "magenta" || n == "pink") return tft.color565(0xff, 0x6a, 0xd5);
   if (n == "orange")  return tft.color565(0xff, 0x9a, 0x3d);
+  if (n == "purple")  return tft.color565(0xb0, 0x7d, 0xff);
+  if (n == "sky")     return tft.color565(0x5a, 0xc8, 0xff);
+  if (n == "lime")    return tft.color565(0xc6, 0xff, 0x4d);
+  if (n == "rose")    return tft.color565(0xff, 0x6a, 0x8a);
+  if (n == "gold")    return tft.color565(0xff, 0xd2, 0x4d);
+  if (n == "mint")    return tft.color565(0x6a, 0xff, 0xc2);
   return 0xFFFF;  // 0xFFFF = "unknown"
 }
 
 // ---- screen modes ----
-enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT, MODE_TEXT, MODE_WIFI, MODE_MAP, MODE_GAME };
+enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT, MODE_TEXT, MODE_WIFI, MODE_MAP, MODE_GAME, MODE_CALIB };
 static int uiMode = MODE_CHAT;
 static int selIdx = 0;
 // Settings are organized as a main page with per-category sub-pages (BlackBerry
 // style: <=6 options each, item 0 is always Back). selIdx indexes the current page.
-enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_COUNT };
+enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_SSH, PG_COUNT };
 static int setPage = PG_MAIN;
+static int setFirst = 0;     // first visible row (settings scroll window)
 static String setMsg = "";   // transient status line (e.g. provider switch result)
-static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
-static const int NPAL = 9;
+static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange",
+                                  "purple","sky","lime","rose","gold","mint","ink"};
+static const int NPAL = 15;
 static int palIndexOf(uint16_t c) { for (int i = 0; i < NPAL; i++) if (namedColor(PAL_NAMES[i]) == c) return i; return 0; }
 #define TB_CLICK 0   // trackball center button (BOARD_BOOT_PIN / GPIO0)
 
@@ -292,13 +346,43 @@ static void draw() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   int rx = 4 + tft.textWidth("RoostOS");
-  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" Communicator", rx, 4);
+  // per-mode title (always starts with RoostOS)
+  const char* suffix = (statusMode == STAT_DEMO) ? " AI Communicator"
+                     : (statusMode == STAT_PHONE) ? " AI" : " Communicator";
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(suffix, rx, 4);
   // menu button (hamburger) top-right — tap to open Settings
   for (int b = 0; b < 3; b++) tft.fillRect(scrW - 20, 3 + b * 4, 15, 2, C_AMBER);
-  String net = WiFi.status() == WL_CONNECTED
-    ? (WiFi.SSID() + " " + WiFi.localIP().toString()) : String("WiFi down");
+  int rEdge = scrW - 24;   // content ends left of the menu button
+  auto drawBars = [&](int x) {                      // 4 wifi bars at [x..x+15]
+    int lvl = wifiLevel();
+    for (int i = 0; i < 4; i++) { int h = 3 + i * 2;
+      tft.fillRect(x + i * 4, 11 - h, 3, h, i < lvl ? C_TEAL : C_PANEL);
+      tft.drawRect(x + i * 4, 11 - h, 3, h, i < lvl ? C_TEAL : C_DIM); }
+  };
+  auto drawBatt = [&](int rightX) -> int {          // battery pill; returns its left x
+    int bpct = batteryPct(); bool chg = batteryCharging();
+    int w = 18, h = 9, x = rightX - w, y = 3;
+    tft.drawRect(x, y, w, h, C_DIM); tft.fillRect(x + w, y + 2, 2, h - 4, C_DIM);  // nub
+    int fill = (w - 2) * bpct / 100;
+    tft.fillRect(x + 1, y + 1, fill, h - 2, chg ? C_TEAL : (bpct <= 15 ? C_AMBER : C_INK));
+    if (chg) { tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("+", x - 6, 4); }  // charging
+    return x - (chg ? 8 : 2);
+  };
   tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString(net, scrW - tft.textWidth(net) - 24, 4);
+  if (statusMode == STAT_IP) {                      // SSID + IP (dev/info)
+    String s = WiFi.status() == WL_CONNECTED ? (WiFi.SSID() + " " + WiFi.localIP().toString()) : String("WiFi down");
+    tft.drawString(s, rEdge - tft.textWidth(s), 4);
+  } else if (statusMode == STAT_DEMO) {             // bars + battery (no SSID/IP) — photo-friendly
+    int bx = rEdge - 16; drawBars(bx);
+    drawBatt(bx - 6);
+  } else {                                          // PHONE: clock + battery + bars
+    int bx = rEdge - 16; drawBars(bx);
+    int batLeft = drawBatt(bx - 6);
+    time_t nowt = time(nullptr);
+    if (nowt > 1700000000) { nowt += (time_t)tzOffsetMin * 60; struct tm tmv; gmtime_r(&nowt, &tmv);
+      char c[8]; strftime(c, sizeof(c), "%H:%M", &tmv);
+      tft.setTextColor(C_DIM, C_PANEL); tft.drawString(c, batLeft - 4 - tft.textWidth(c), 4); }
+  }
 
   // input-box metrics (its own font)
   setFont(inputFontIdx);
@@ -332,15 +416,27 @@ static void draw() {
   if (start > 0)              tft.drawString("^", scrW - 12, top);
   if (end < (int)wl.size())   tft.drawString("v", scrW - 12, inputY - 12);
 
-  // input line (own font, amber prompt)
+  // input line (own font, amber prompt) + a tappable clear-chat button
+  const int cbw = 34;
   tft.fillRect(0, inputY, scrW, inputH, C_PANEL);
   setFont(inputFontIdx);
-  tft.setTextColor(C_AMBER, C_PANEL); tft.drawString("> ", 2, inputY + 2);
+  tft.setTextColor(accentColor, C_PANEL); tft.drawString("> ", 2, inputY + 2);
   int pw = tft.textWidth("> ") + 2;
   tft.setTextColor(C_INK, C_PANEL);
   String shown = input;
-  while (shown.length() && tft.textWidth(shown) > maxW - pw) shown = shown.substring(1);
+  while (shown.length() && tft.textWidth(shown) > maxW - pw - cbw) shown = shown.substring(1);
   tft.drawString(shown, 2 + pw, inputY + 2);
+  // clear button (bottom-right)
+  tft.drawRoundRect(scrW - cbw, inputY + 1, cbw - 2, inputH - 2, 3, C_DIM);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_DIM, C_PANEL); tft.drawString("clr", scrW - cbw / 2 - 1, inputY + inputH / 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void clearChat() {
+  msgs.clear(); scrollLines = 0; input = "";
+  addMsg("Ready to Roost! Type a message + Enter, or tap the menu.", C_TEAL);
+  draw();
 }
 
 // ---- Settings screen: main page + per-category sub-pages ----
@@ -353,11 +449,13 @@ static String activeSsid();
 static void draw();
 static void showMap(double lat, double lon, int zoom);
 static void gameLaunch(int which);
+static void startCalibration();
+void sshRegenHostKey();
 
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
   labels.clear(); values.clear();
-  auto row = [&](const char* l, const String& v){ labels.push_back(l); values.push_back(v); };
+  auto row = [&](const String& l, const String& v){ labels.push_back(l); values.push_back(v); };
   switch (pg) {
     case PG_MAIN:
       row("Back to chat", "");
@@ -365,6 +463,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("Display", ">"); row("Colors", ">");
       row("AI Provider", aiProvider);
       row("Device", ">");
+      row("SSH", sshOn ? "on :22" : "off");
       row("System / About", ">");
       return "Settings";
     case PG_APPS:
@@ -372,16 +471,20 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("Map", locValid ? "gps" : (lastMapValid ? "saved" : "no fix"));
       row("Snake", ">");
       row("Sudoku", ">");
+      row("Slide 1-11", ">");
       row("GPS status", locValid ? String(locLat, 3) + "," + String(locLon, 3) : String("no fix"));
       return "Apps";
     case PG_DEVICE:
       row("< Back", "");
       row("Your name", userName.length() ? userName : String("(set)"));
+      row("Chat label", youLabel);
       row("Timezone", (tzOffsetMin >= 0 ? "+" : "-") + String(abs(tzOffsetMin) / 60) + "h");
       row("Brightness", String((brightness * 100) / 255) + "%");
       row("Sounds", soundsOn ? "on" : "off");
       row("Trackball", trackballOn ? "on" : "off");
       row("Web search", webSearchOn ? "on" : "off");
+      row("Status bar", statusName());
+      row("Calibrate touch", touchCalValid ? "done" : "needed");
       return "Device";
     case PG_DISPLAY:
       row("< Back", "");
@@ -392,8 +495,9 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       return "Display";
     case PG_COLORS:
       row("< Back", "");
-      row("Your color", PAL_NAMES[palIndexOf(userColor)]);
+      row(youLabel + " color", PAL_NAMES[palIndexOf(userColor)]);
       row("AI color",   PAL_NAMES[palIndexOf(aiColor)]);
+      row("Accent/buttons", PAL_NAMES[palIndexOf(accentColor)]);
       return "Colors";
     case PG_AI: {
       row("< Back", "");
@@ -409,13 +513,20 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
     case PG_SYSTEM:
       row("< Back", "");
       row("About", ">");
-      row("WiFi setup", WiFi.isConnected() ? WiFi.SSID() : String("down"));
+      row("WiFi setup", WiFi.isConnected() ? dispSsid() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
-      row("SSH server", sshOn ? "on :22" : "off");
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
       return "System";
+    case PG_SSH:
+      row("< Back", "");
+      row("Enabled", sshOn ? "on :22" : "off");
+      row("User", sshUser.length() ? sshUser : String("(unset)"));
+      row("Password", sshPass.length() ? sshPass : String("(unset)"));
+      row("Connect", WiFi.isConnected() ? ("ssh " + (sshUser.length() ? sshUser : String("user")) + "@" + WiFi.localIP().toString()) : String("wifi down"));
+      row("Regen host key", ">");
+      return "SSH";
   }
   return "Settings";
 }
@@ -433,23 +544,40 @@ static void drawSettings() {
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   tft.setTextColor(C_INK, C_PANEL); tft.drawString(" " + title, 4 + tft.textWidth("RoostOS"), 4);
   setFont(1);   // small
-  int lh = tft.fontHeight() + 6, y = headerH + 6;
-  for (int i = 0; i < (int)labels.size(); i++) {
+  int lh = tft.fontHeight() + 6, y0 = headerH + 6;
+  int n = (int)labels.size();
+  int availH = (scrH - 14) - y0;
+  int rowsVis = availH / lh; if (rowsVis < 1) rowsVis = 1;
+  // scroll window so the selected row stays visible (handles long pages)
+  int first = 0;
+  if (n > rowsVis) { if (selIdx >= rowsVis) first = selIdx - rowsVis + 1;
+                     if (first > n - rowsVis) first = n - rowsVis; if (first < 0) first = 0; }
+  setFirst = first;
+  int y = y0;
+  for (int i = first; i < first + rowsVis && i < n; i++) {
     bool sel = (i == selIdx);
     if (sel) tft.fillRect(0, y - 2, scrW, lh, C_PANEL);
-    uint16_t c = sel ? C_AMBER : C_INK;
-    // colour swatch preview on the Colors page
-    if (setPage == PG_COLORS && i == 1 && !sel) c = userColor;
-    if (setPage == PG_COLORS && i == 2 && !sel) c = aiColor;
-    tft.setTextColor(c, sel ? C_PANEL : C_BG);
+    uint16_t bg = sel ? C_PANEL : C_BG;
+    tft.setTextColor(sel ? C_AMBER : C_INK, bg);
     tft.drawString(labels[i], 6, y);
-    if (values[i].length()) {
-      tft.setTextColor(sel ? C_INK : C_DIM, sel ? C_PANEL : C_BG);
+    // color rows: draw a real swatch (WYSIWYG) + the name, so selection is clear
+    bool colorRow = (setPage == PG_COLORS && i >= 1 && i <= 3);
+    if (colorRow) {
+      uint16_t sc = (i == 1) ? userColor : (i == 2) ? aiColor : accentColor;
+      int sw = 26, sh = lh - 8, sxp = scrW - sw - 8;
+      tft.fillRect(sxp, y, sw, sh, sc); tft.drawRect(sxp, y, sw, sh, C_DIM);
+      tft.setTextColor(sel ? C_INK : C_DIM, bg);
+      tft.drawString(values[i], sxp - tft.textWidth(values[i]) - 6, y);
+    } else if (values[i].length()) {
+      tft.setTextColor(sel ? C_INK : C_DIM, bg);
       tft.drawString(values[i], scrW - tft.textWidth(values[i]) - 8, y);
     }
     y += lh;
   }
-  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_AMBER, C_BG);
+  if (first > 0)              tft.drawString("^", scrW - 12, y0);
+  if (first + rowsVis < n)    tft.drawString("v", scrW - 12, scrH - 24);
+  tft.setTextColor(C_DIM, C_BG);
   if (setMsg.length()) tft.drawString(setMsg, 4, scrH - 12);
   else tft.drawString(setPage == PG_MAIN ? "ball: roll=move  click=open  (or /set)"
                                          : "ball: roll=move  click=change  < Back to return", 4, scrH - 12);
@@ -461,19 +589,22 @@ static void drawAbout() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   tft.setTextColor(C_INK, C_PANEL); tft.drawString(" About", 4 + tft.textWidth("RoostOS"), 4);
-  setFont(1);
-  int y = headerH + 6, lh = tft.fontHeight() + 4;
-  auto row = [&](const String& a, const String& b) {
+  setFont(0);   // tiny GLCD so all rows fit without scrolling
+  int y = headerH + 5, lh = tft.fontHeight() + 4;
+  auto row = [&](const String& a, const String& b, uint16_t bc = 0) {
     tft.setTextColor(C_DIM, C_BG); tft.drawString(a, 6, y);
-    tft.setTextColor(C_INK, C_BG); tft.drawString(b, 96, y); y += lh;
+    tft.setTextColor(bc ? bc : C_INK, C_BG); tft.drawString(b, 88, y); y += lh;
   };
+  row("Product", "RoostOS Communicator", C_TEAL);
+  row("Web", "roostos.dev/tdeck", C_AMBER);
+  row("GitHub", "github.com/StevenSSparks/roost-tdeck", C_AMBER);
   row("Version", ROOST_COMM_VERSION);
   row("Device", "T-Deck Plus (S3)");
   row("MAC", WiFi.macAddress());
   row("IP", WiFi.localIP().toString());
-  row("WiFi", WiFi.SSID() + " " + String(WiFi.RSSI()) + "dBm");
-  row("Heap", String(ESP.getFreeHeap() / 1024) + "K free");
-  row("PSRAM", String(ESP.getFreePsram() / 1024) + "K free");
+  row("WiFi", dispSsid() + " " + String(WiFi.RSSI()) + "dBm");
+  row("Status bar", statusName());
+  row("Heap/PSRAM", String(ESP.getFreeHeap() / 1024) + "K / " + String(ESP.getFreePsram() / 1024) + "K");
   row("Uptime", String(millis() / 1000) + "s");
   row("Touch", gtAddr ? "GT911 0x" + String(gtAddr, HEX) : "none");
   tft.setTextColor(C_AMBER, C_BG); tft.drawString("tap / any key = back", 4, scrH - 12);
@@ -483,7 +614,7 @@ static void drawAbout() {
 static String nextModel(const String& p, const String& cur) {
   const char* an[] = {"claude-haiku-4-5", "claude-sonnet-4-6"};
   const char* oa[] = {"gpt-4o-mini", "gpt-4o"};
-  const char* ge[] = {"gemini-2.0-flash-lite", "gemini-2.0-flash"};
+  const char* ge[] = {"gemini-flash-lite-latest", "gemini-2.5-flash"};
   const char* ol[] = {"llama3.2", "qwen2.5", "phi3"};
   const char** L; int n;
   if (p == "openai")      { L = oa; n = 2; }
@@ -509,6 +640,10 @@ static void drawText() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   tft.setTextColor(C_INK, C_PANEL);  tft.drawString(" " + textTitle, 4 + tft.textWidth("RoostOS"), 4);
+  // [X] cancel button (top-right) — the keyboard has no Esc key
+  tft.drawRect(scrW - 16, 1, 14, headerH - 2, C_DIM);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(C_AMBER, C_PANEL);
+  tft.drawString("X", scrW - 9, headerH / 2); tft.setTextDatum(TL_DATUM);
   setFont(1);
   int y = headerH + 18;
   tft.setTextColor(C_DIM, C_BG); tft.drawString(textHint.length() ? textHint : String("type, then Enter"), 8, y);
@@ -522,7 +657,7 @@ static void drawText() {
   while (shown.length() && tft.textWidth(shown) > scrW - 30 - pw) shown = shown.substring(1);
   tft.drawString(shown + "_", 10 + pw, y + 2);
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
-  tft.drawString("Enter = save    Esc = cancel", 4, scrH - 12);
+  tft.drawString("Enter = save    tap X / click ball = cancel", 4, scrH - 12);
 }
 static void openText(const String& title, const String& initial, const String& hint,
                      bool mask, int returnMode, std::function<void(String)> cb) {
@@ -540,7 +675,8 @@ static void activateSetting() {
       case 3: setPage = PG_COLORS;  selIdx = 0; break;
       case 4: setPage = PG_AI;      selIdx = 0; break;
       case 5: setPage = PG_DEVICE;  selIdx = 0; break;
-      case 6: setPage = PG_SYSTEM;  selIdx = 0; break;
+      case 6: setPage = PG_SSH;     selIdx = 0; break;
+      case 7: setPage = PG_SYSTEM;  selIdx = 0; break;
     }
     drawSettings(); return;
   }
@@ -555,7 +691,8 @@ static void activateSetting() {
                 setMsg = "no location; use /map <lat> <lon>"; break;
         case 2: gameLaunch(0); return;   // Snake
         case 3: gameLaunch(1); return;   // Sudoku
-        case 4: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
+        case 4: gameLaunch(2); return;   // Slide
+        case 5: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
       }
       break;
     case PG_DISPLAY:
@@ -569,8 +706,9 @@ static void activateSetting() {
       }
       break;
     case PG_COLORS:
-      if (selIdx == 1) userColor = namedColor(PAL_NAMES[(palIndexOf(userColor) + 1) % NPAL]);
-      if (selIdx == 2) aiColor   = namedColor(PAL_NAMES[(palIndexOf(aiColor)   + 1) % NPAL]);
+      if (selIdx == 1) userColor   = namedColor(PAL_NAMES[(palIndexOf(userColor)   + 1) % NPAL]);
+      if (selIdx == 2) aiColor     = namedColor(PAL_NAMES[(palIndexOf(aiColor)     + 1) % NPAL]);
+      if (selIdx == 3) accentColor = namedColor(PAL_NAMES[(palIndexOf(accentColor) + 1) % NPAL]);
       break;
     case PG_AI: {
       int modelRow = 1 + NPROV;   // rows 1..NPROV are providers, then Model
@@ -586,18 +724,24 @@ static void activateSetting() {
     }
     case PG_DEVICE:
       switch (selIdx) {
-        case 1:  // Your name -> text entry
+        case 1:  // Your name -> text entry (used in the AI system prompt)
           openText("Your name", userName, "so the AI can greet you", false, MODE_SETTINGS,
                    [](String v){ userName = v; saveCfg(); });
           return;
-        case 2: { // Timezone: cycle -12h..+14h in 1h steps
+        case 2:  // Chat label -> the "You:" tag (name or initials)
+          openText("Chat label", youLabel, "your name tag in chat (e.g. initials)", false, MODE_SETTINGS,
+                   [](String v){ youLabel = v.length() ? v : String("You"); saveCfg(); });
+          return;
+        case 3: { // Timezone: cycle -12h..+14h in 1h steps
           tzOffsetMin += 60; if (tzOffsetMin > 14 * 60) tzOffsetMin = -12 * 60; break; }
-        case 3: { // Brightness: 20/40/60/80/100%
+        case 4: { // Brightness: 20/40/60/80/100%
           int pct = (brightness * 100) / 255; pct += 20; if (pct > 100) pct = 20;
           brightness = (pct * 255) / 100; applyBrightness(); break; }
-        case 4: soundsOn    = !soundsOn;    break;
-        case 5: trackballOn = !trackballOn; break;
-        case 6: webSearchOn = !webSearchOn; break;
+        case 5: soundsOn    = !soundsOn;    break;
+        case 6: trackballOn = !trackballOn; break;
+        case 7: webSearchOn = !webSearchOn; break;
+        case 8: statusMode = (statusMode + 1) % 3; break;   // cycle IP/Demo/Phone
+        case 9: startCalibration(); return;    // Calibrate touch
       }
       break;
     case PG_SYSTEM:
@@ -614,12 +758,26 @@ static void activateSetting() {
             });
           return;
         case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
-        case 4: sshOn = !sshOn; break;                                  // SSH server toggle
-        case 5:  // Map key entry
+        case 4:  // Map key entry (SSH moved to the main settings page)
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 4; });
           return;
         // IP / Uptime rows are read-only status
+      }
+      break;
+    case PG_SSH:
+      switch (selIdx) {
+        case 1: sshOn = !sshOn; break;   // Enabled toggle (only starts if creds set)
+        case 2:  // User
+          openText("SSH user", sshUser, "login name for ssh", false, MODE_SETTINGS,
+                   [](String v){ sshUser = v; saveCfg(); setPage = PG_SSH; selIdx = 2; });
+          return;
+        case 3:  // Password (cleartext, per request)
+          openText("SSH password", sshPass, "login password for ssh", false, MODE_SETTINGS,
+                   [](String v){ sshPass = v; saveCfg(); setPage = PG_SSH; selIdx = 3; });
+          return;
+        // case 4 Connect: read-only helper text
+        case 5: sshRegenHostKey(); setMsg = "new host key (clients must re-accept)"; break;
       }
       break;
   }
@@ -771,19 +929,33 @@ static String aiLabel() {
   return "Haiku";
 }
 
+// Light markdown stripper for the tiny screen: drop **bold**/__/` markers and
+// leading # header hashes so they don't render as literal clutter. Not a renderer.
+static String deMarkdown(String s) {
+  s.replace("**", ""); s.replace("__", ""); s.replace("`", "");
+  int i = 0;
+  while ((i = s.indexOf('#', i)) >= 0) {
+    if (i == 0 || s[i - 1] == '\n') {           // only header hashes at line start
+      int j = i; while (j < (int)s.length() && (s[j] == '#' || s[j] == ' ')) j++;
+      s.remove(i, j - i);
+    } else i++;
+  }
+  return s;
+}
+
 static void sendPrompt(const String& prompt) {
   scrollLines = 0;
   String lbl = aiLabel() + ": ";
-  addMsg("You: " + prompt, userColor);
+  addMsg(youLabel + ": " + prompt, userColor);
   addMsg("...", C_DIM); draw();
-  String reply = askAI(prompt);
+  String reply = deMarkdown(askAI(prompt));
   Serial.println(lbl + reply);
   if (!msgs.empty()) msgs.pop_back();       // remove "..."
   addMsg(lbl + reply, aiColor);
   // show YOUR message at the top of the new exchange (scroll down for long replies)
   setFont(chatFontIdx);
   std::vector<String> ex;
-  wrapMsg("You: " + prompt, scrW - 4, ex);
+  wrapMsg(youLabel + ": " + prompt, scrW - 4, ex);
   wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
@@ -804,28 +976,88 @@ static void gtProbe() {
   }
   Serial.printf("[touch] GT911 addr=0x%02X\n", gtAddr);
 }
+// Read a GT911 16-bit register block using a repeated-START (no STOP between the
+// address write and the read) — required for correct byte alignment.
+static bool gtRead(uint16_t reg, uint8_t* out, uint8_t n) {
+  Wire.beginTransmission(gtAddr);
+  Wire.write((uint8_t)(reg >> 8)); Wire.write((uint8_t)(reg & 0xFF));
+  if (Wire.endTransmission(false) != 0) return false;   // repeated start
+  uint8_t got = Wire.requestFrom(gtAddr, n);
+  for (uint8_t i = 0; i < n && Wire.available(); i++) out[i] = Wire.read();
+  return got == n;
+}
+static void gtWrite(uint16_t reg, uint8_t val) {
+  Wire.beginTransmission(gtAddr);
+  Wire.write((uint8_t)(reg >> 8)); Wire.write((uint8_t)(reg & 0xFF)); Wire.write(val);
+  Wire.endTransmission();
+}
 // Read one touch point. Returns raw controller coords in rx/ry; false if no touch.
 static bool gtReadRaw(int& rx, int& ry) {
   if (!gtAddr) return false;
-  Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x4E);
-  if (Wire.endTransmission() != 0) return false;
-  Wire.requestFrom(gtAddr, (uint8_t)1);
-  if (!Wire.available()) return false;
-  uint8_t st = Wire.read();
-  bool touched = (st & 0x80) && (st & 0x0F);
-  if (touched) {
-    Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x50);
-    Wire.endTransmission();
-    Wire.requestFrom(gtAddr, (uint8_t)8);
-    uint8_t b[8]; int i = 0; while (Wire.available() && i < 8) b[i++] = Wire.read();
-    if (i >= 5) { rx = b[1] | (b[2] << 8); ry = b[3] | (b[4] << 8); }
+  uint8_t st = 0;
+  if (!gtRead(0x814E, &st, 1)) return false;    // GT_POINT_INFO
+  bool ready = st & 0x80, touched = false;
+  if (ready && (st & 0x0F)) {
+    uint8_t p[6];
+    if (gtRead(0x8150, p, 6)) {                 // point 1 coords: xL,xH,yL,yH,szL,szH
+      rx = p[0] | (p[1] << 8); ry = p[2] | (p[3] << 8); touched = true;
+    }
   }
-  Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x4E); Wire.write(0);
-  Wire.endTransmission();
+  if (ready) gtWrite(0x814E, 0);                // clear buffer-status flag
   return touched;
 }
-// Map raw touch -> screen coords for TFT rotation 1. FIRST GUESS — calibrated from serial logs.
-static void gtMap(int rx, int ry, int& sx, int& sy) { sx = rx; sy = ry; }
+// Map raw GT911 coords -> screen coords via the calibrated affine transform.
+// Uncalibrated defaults are identity (a runtime calibration wizard sets these).
+static void gtMap(int rx, int ry, int& sx, int& sy) {
+  sx = (int)(tcAx * rx + tcBx * ry + tcCx);
+  sy = (int)(tcAy * rx + tcBy * ry + tcCy);
+  if (sx < 0) sx = 0; if (sx >= scrW) sx = scrW - 1;
+  if (sy < 0) sy = 0; if (sy >= scrH) sy = scrH - 1;
+}
+
+// ---- 3-point touch calibration wizard (MODE_CALIB) ----
+// Solve s = a*rx + b*ry + c from three (rx,ry)->s samples (Cramer's rule).
+static bool solve3(const float rx[3], const float ry[3], const float s[3],
+                   float& a, float& b, float& c) {
+  float det = rx[0]*(ry[1]-ry[2]) - ry[0]*(rx[1]-rx[2]) + (rx[1]*ry[2]-rx[2]*ry[1]);
+  if (fabsf(det) < 1e-3f) return false;
+  float da = s[0]*(ry[1]-ry[2]) - ry[0]*(s[1]-s[2]) + (s[1]*ry[2]-s[2]*ry[1]);
+  float db = rx[0]*(s[1]-s[2]) - s[0]*(rx[1]-rx[2]) + (rx[1]*s[2]-rx[2]*s[1]);
+  float dc = rx[0]*(ry[1]*s[2]-s[1]*ry[2]) - ry[0]*(rx[1]*s[2]-s[1]*rx[2]) + s[0]*(rx[1]*ry[2]-rx[2]*ry[1]);
+  a = da/det; b = db/det; c = dc/det; return true;
+}
+static int   calStep = 0;
+static long  calAccX = 0, calAccY = 0; static int calAccN = 0;   // press accumulator
+static float calRX[3], calRY[3], calTX[3], calTY[3];
+static void drawCalTarget() {
+  tft.fillScreen(C_BG); tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_INK, C_BG);
+  tft.drawString("Touch calibration", scrW/2, 26);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("tap each target (" + String(calStep+1) + "/3)", scrW/2, 44);
+  int x = (int)calTX[calStep], y = (int)calTY[calStep];
+  tft.drawCircle(x, y, 10, C_AMBER); tft.drawCircle(x, y, 2, C_AMBER);
+  tft.drawFastHLine(x-14, y, 28, C_TEAL); tft.drawFastVLine(x, y-14, 28, C_TEAL);
+}
+static void startCalibration() {
+  uiMode = MODE_CALIB; calStep = 0; calAccX = calAccY = 0; calAccN = 0;
+  calTX[0] = 30;        calTY[0] = 30;
+  calTX[1] = scrW - 30; calTY[1] = 30;
+  calTX[2] = 30;        calTY[2] = scrH - 30;
+  drawCalTarget();
+}
+static void calRecord(int rx, int ry) {   // called on a discrete tap during MODE_CALIB
+  calRX[calStep] = rx; calRY[calStep] = ry; calStep++;
+  if (calStep < 3) { drawCalTarget(); return; }
+  float ax,bx,cx,ay,by,cy;
+  bool ok = solve3(calRX, calRY, calTX, ax, bx, cx) &&
+            solve3(calRX, calRY, calTY, ay, by, cy);
+  if (ok) { tcAx=ax; tcBx=bx; tcCx=cx; tcAy=ay; tcBy=by; tcCy=cy;
+            touchCalValid = true; saveCfg();
+            Serial.printf("[cal] ok ax=%.4f bx=%.4f cx=%.1f ay=%.4f by=%.4f cy=%.1f\n", ax,bx,cx,ay,by,cy);
+            uiMode = MODE_CHAT; draw(); }
+  else { Serial.println("[cal] degenerate - restarting"); calStep = 0; drawCalTarget(); }   // retry
+}
 
 // Active credentials: on-device override (Settings) wins over secrets.h defaults.
 static String activeSsid() { return wifiSsid.length() ? wifiSsid : String(DEFAULT_WIFI_SSID); }
@@ -853,6 +1085,20 @@ static bool joinWifi(const String& ssid, const String& pass) {
 }
 
 // Branded boot splash: RoostOS wordmark + a little chick perched on an antenna.
+// Brief "charging connected" splash (shown when the pack voltage rises on plug-in).
+static void drawChargeSplash() {
+  tft.fillScreen(C_BG); tft.setTextDatum(MC_DATUM);
+  int w = 128, h = 58, x = (scrW - w) / 2, y = (scrH - h) / 2 - 8;
+  tft.drawRoundRect(x, y, w, h, 6, C_TEAL); tft.fillRect(x + w, y + h / 2 - 8, 6, 16, C_TEAL);   // battery + nub
+  int pct = batteryPct(); tft.fillRect(x + 3, y + 3, (w - 6) * pct / 100, h - 6, C_TEAL);
+  // lightning bolt (amber)
+  int cx = scrW / 2, cy = y + h / 2;
+  tft.fillTriangle(cx + 4, cy - 16, cx - 8, cy + 3, cx + 2, cy + 3, C_AMBER);
+  tft.fillTriangle(cx - 4, cy + 16, cx + 8, cy - 3, cx - 2, cy - 3, C_AMBER);
+  tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_AMBER, C_BG);
+  tft.drawString("Charging  " + String(pct) + "%", scrW / 2, y + h + 22);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+}
 static void drawSplash() {
   tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
   tft.setFreeFont(&FreeSans18pt7b);
@@ -895,7 +1141,7 @@ void setup() {
   C_TEAL   = tft.color565(0x34, 0xe2, 0xc0);
   C_INDIGO = tft.color565(0x7c, 0x8c, 0xff);
   C_AMBER  = tft.color565(0xff, 0xbe, 0x4d);
-  userColor = C_INDIGO; aiColor = C_TEAL;   // defaults
+  userColor = C_INDIGO; aiColor = C_TEAL; accentColor = C_AMBER;   // defaults
   loadCfg();                                 // override from saved settings (NVS)
   applyBrightness();                         // LEDC PWM backlight at saved level
 
@@ -966,13 +1212,15 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "inputfont")) { inputFontIdx = fontArgToIdx(rest, inputFontIdx); saveCfg(); draw(); return String("input font: ") + FONTS[inputFontIdx].name; }
   if (cmdIs(tok, "color")) {
     int p = rest.indexOf(' ');
-    if (p < 0) return "usage: /color user|ai <name>";
+    if (p < 0) return "usage: /color user|ai|accent <name>";
     String who = rest.substring(0, p), name = rest.substring(p + 1); name.trim();
     uint16_t col = namedColor(name);
-    if (col == 0xFFFF) return "colors: teal indigo amber red green cyan magenta orange ink dim";
-    if (who.startsWith("u")) userColor = col; else if (who.startsWith("a")) aiColor = col; else return "usage: /color user|ai <name>";
+    if (col == 0xFFFF) return "colors: teal indigo amber red green cyan magenta orange purple sky lime rose gold mint ink";
+    if (who.startsWith("u")) userColor = col; else if (who.startsWith("ai") || who == "a") aiColor = col;
+    else if (who.startsWith("acc")) accentColor = col; else return "usage: /color user|ai|accent <name>";
     saveCfg(); draw(); return who + " color set";
   }
+  if (cmdIs(tok, "you")) { youLabel = rest.length() ? rest : String("You"); saveCfg(); if (uiMode == MODE_CHAT) draw(); return "chat label: " + youLabel; }
   if (cmdIs(tok, "scroll")) { scrollStep = constrain(rest.toInt(), 1, 20); saveCfg(); return String("scroll rate: ") + scrollStep; }
   if (cmdIs(tok, "splash")) { splashMs = constrain(rest.toInt(), 0, 15000); saveCfg(); return String("splash: ") + splashMs + "ms"; }
   if (cmdIs(tok, "provider")) {
@@ -992,6 +1240,14 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
   if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
   if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
+  if (cmdIs(tok, "status") || cmdIs(tok, "demo")) {   // status bar mode
+    String v = rest; v.toLowerCase();
+    if (v.startsWith("ip") || v == "off") statusMode = STAT_IP;
+    else if (v.startsWith("demo") || v == "on") statusMode = STAT_DEMO;
+    else if (v.startsWith("phone")) statusMode = STAT_PHONE;
+    else return "status: ip | demo | phone";
+    saveCfg(); if (uiMode == MODE_CHAT) draw(); return String("status bar: ") + statusName();
+  }
   if (cmdIs(tok, "ssh")) { sshOn = (rest == "on" || rest == "1"); saveCfg();
     return String("ssh: ") + (sshOn ? "on - ssh " + sshUser + "@<ip> (pw set in /sshpass)" : "off"); }
   if (cmdIs(tok, "sshuser")) { if (rest.length()) { sshUser = rest; saveCfg(); } return "ssh user: " + sshUser; }
@@ -1015,6 +1271,9 @@ static String applyCfgCmd(String s) {
     return "game: snake | sudoku"; }
   if (tok == "snake")  { gameLaunch(0); return "snake"; }
   if (tok == "sudoku") { gameLaunch(1); return "sudoku"; }
+  if (tok == "slide")  { gameLaunch(2); return "slide"; }
+  if (cmdIs(tok, "calibrate")) { startCalibration(); return "calibrate: tap the 3 targets on the screen"; }
+  if (cmdIs(tok, "clear")) { clearChat(); return "chat cleared"; }
   if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
   if (cmdIs(tok, "key")) {   // /key anthropic|openai|gemini <api-key>
     int p = rest.indexOf(' ');
@@ -1105,7 +1364,7 @@ static void showMap(double lat, double lon, int zoom) {
 //  (Plain TCP now; real SSH via libssh_esp32 is the next transport step.)
 // ============================================================================
 // ---- real SSH server (src/app/ssh_server.cpp), driven from this shell ----
-void sshServerStart(); void sshServerStop();
+void sshServerStart(); void sshServerStop(); void sshRegenHostKey();
 bool sshPopLine(String& out); void sshQueueOut(const char* s);
 bool sshActive(); bool sshIsRunning();
 extern "C" void sshSetCreds(const char* u, const char* p);
@@ -1155,7 +1414,7 @@ static String shellConfigSummary() {
   String s = "provider: " + aiProvider + " / " + aiModel + "\r\n";
   s += "name: " + (userName.length() ? userName : String("(unset)")) + "\r\n";
   s += "tz: UTC" + String(tzOffsetMin >= 0 ? "+" : "") + String(tzOffsetMin / 60.0, 1) + "h\r\n";
-  s += "wifi: " + (WiFi.isConnected() ? WiFi.SSID() : String("down")) + "  ip: " + WiFi.localIP().toString() + "\r\n";
+  s += "wifi: " + (WiFi.isConnected() ? dispSsid() : String("down")) + "  ip: " + WiFi.localIP().toString() + "\r\n";
   s += "brightness: " + String((brightness * 100) / 255) + "%  sounds: " + (soundsOn ? "on" : "off") +
        "  trackball: " + (trackballOn ? "on" : "off") + "\r\n";
   s += "map key: " + String(mapKey.length() ? "set" : "none") + "  web search: " + (webSearchOn ? "on" : "off") + "\r\n";
@@ -1189,10 +1448,10 @@ static void handleShellLine(String line) {
     shellPrint((r.length() ? r : String("unknown command (try /help)")) + "\r\n"); shellPrompt(); return;
   }
   // free text => chat (shared with the on-screen buffer)
-  addMsg("You (ssh): " + line, userColor);
+  addMsg(youLabel + " (ssh): " + line, userColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint("...\r\n");
-  String reply = askAI(line);
+  String reply = deMarkdown(askAI(line));
   addMsg(aiLabel() + ": " + reply, aiColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint(aiLabel() + ": " + reply + "\r\n");
@@ -1222,13 +1481,14 @@ static void pollShell() {
 // ============================================================================
 //  Games: Snake (trackball/WASD) + Sudoku (QWERTY). MODE_GAME; Esc/q = back.
 // ============================================================================
-static int gGame = 0;               // 0 = snake, 1 = sudoku
+static int gGame = 0;               // 0 = snake, 1 = sudoku, 2 = slide
 // --- Snake ---
 static const int CELL = 12;
+static const int SNK_CTRL = 46;     // bottom control-bar (D-pad) height
 static int gCols, gRows;
 static std::vector<std::pair<int,int>> snake;
 static int sdx = 1, sdy = 0, ndx = 1, ndy = 0, gScore = 0;
-static bool gDead = false;
+static bool gDead = false, gStarted = false;   // waits for first input before moving
 static uint32_t gTickT = 0;
 static void placeFood(int& fx, int& fy) {
   bool ok; do { ok = true; fx = random(gCols); fy = random(gRows);
@@ -1237,22 +1497,70 @@ static void placeFood(int& fx, int& fy) {
 }
 static int gFoodX, gFoodY;
 static void snakeInit() {
-  gCols = scrW / CELL; gRows = (scrH - headerH) / CELL;
+  gCols = scrW / CELL; gRows = (scrH - headerH - SNK_CTRL) / CELL;
   snake.clear(); snake.push_back({gCols / 2, gRows / 2});
-  sdx = ndx = 1; sdy = ndy = 0; gScore = 0; gDead = false;
+  sdx = ndx = 1; sdy = ndy = 0; gScore = 0; gDead = false; gStarted = false;
   placeFood(gFoodX, gFoodY); gTickT = millis();
+}
+// Shared game header buttons: [new] and [X], top-right. Hit zones (in touch):
+//   new: scrW-54..scrW-18 ;  X: scrW-18..scrW , both sy < headerH+2.
+static void drawGameBtns() {
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(MC_DATUM);
+  tft.fillRect(scrW - 54, 1, 36, headerH - 1, C_BG);
+  tft.drawRect(scrW - 54, 1, 35, headerH - 2, C_DIM);
+  tft.setTextColor(C_TEAL, C_BG); tft.drawString("new", scrW - 36, headerH / 2);
+  tft.fillRect(scrW - 16, 1, 15, headerH - 1, C_BG);
+  tft.drawRect(scrW - 16, 1, 14, headerH - 2, C_DIM);
+  tft.setTextColor(C_AMBER, C_BG); tft.drawString("X", scrW - 9, headerH / 2);
+  tft.setTextDatum(TL_DATUM);
+}
+// Snake D-pad geometry: 4 buttons  <  ^  v  >  across the bottom control bar.
+static const int SNK_DIRS[4][2] = {{-1,0},{0,-1},{0,1},{1,0}};
+static int snakeDpadHit(int sx, int sy) {   // returns 0..3 or -1
+  if (sy < scrH - SNK_CTRL) return -1;
+  int i = sx / (scrW / 4); return (i < 0) ? 0 : (i > 3 ? 3 : i);
 }
 static void snakeDraw() {
   tft.fillScreen(C_BG);
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Snake", 4, 4);
-  tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 60, 4);
-  tft.setTextColor(C_DIM, C_PANEL); tft.drawString(gDead ? "DEAD - any key" : "ball/WASD  q=quit", scrW - 130, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 52, 4);
+  drawGameBtns();
   int oy = headerH;
   tft.fillRect(gFoodX * CELL, oy + gFoodY * CELL, CELL - 1, CELL - 1, C_AMBER);
   for (size_t i = 0; i < snake.size(); i++)
     tft.fillRect(snake[i].first * CELL, oy + snake[i].second * CELL, CELL - 1, CELL - 1, i == 0 ? C_TEAL : C_INDIGO);
+  // D-pad control bar
+  int cy = scrH - SNK_CTRL, bw = scrW / 4;
+  const char* lbl[4] = {"<", "^", "v", ">"};
+  tft.fillRect(0, cy, scrW, SNK_CTRL, C_PANEL);
+  tft.setTextDatum(MC_DATUM);
+  for (int i = 0; i < 4; i++) {
+    int bx = i * bw;
+    tft.drawRoundRect(bx + 2, cy + 3, bw - 4, SNK_CTRL - 6, 5, C_TEAL);
+    tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_INK, C_PANEL);
+    tft.drawString(lbl[i], bx + bw / 2, cy + SNK_CTRL / 2);
+  }
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  int midY = (headerH + (scrH - SNK_CTRL)) / 2;
+  if (!gStarted && !gDead) {                     // waiting to start
+    tft.setTextDatum(MC_DATUM); tft.setTextColor(C_AMBER, C_BG);
+    tft.drawString("press an arrow to start", scrW / 2, midY);
+    tft.setTextDatum(TL_DATUM);
+  }
+  if (gDead) {                                   // GAME OVER + restart prompt (in play area)
+    int bw2 = 200, bh = 66, bx = (scrW - bw2) / 2, by = midY - bh / 2;
+    tft.fillRoundRect(bx, by, bw2, bh, 6, C_PANEL);
+    tft.drawRoundRect(bx, by, bw2, bh, 6, C_TEAL);
+    tft.setTextDatum(MC_DATUM);
+    tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_AMBER, C_PANEL);
+    tft.drawString("GAME OVER", scrW / 2, by + 18);
+    tft.setTextFont(1); tft.setTextSize(1);
+    tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), scrW / 2, by + 38);
+    tft.setTextColor(C_DIM, C_PANEL); tft.drawString("tap 'new' / arrow / key to replay", scrW / 2, by + 52);
+    tft.setTextDatum(TL_DATUM);
+  }
 }
 static void snakeStep() {
   if (gDead) return;
@@ -1266,15 +1574,28 @@ static void snakeStep() {
   snakeDraw();
 }
 static void snakeTurn(int dx, int dy) {   // ignore 180-degree reversals
+  gStarted = true;                        // first input starts the snake moving
   if (dx == -sdx && dy == -sdy) return;
   ndx = dx; ndy = dy;
 }
 // --- Sudoku ---
-static const char* SU_PUZZLE =
-  "530070000600195000098000060800060003400803001700020006060000280000419005000080079";
+static const char* SU_PUZZLES[] = {
+  "530070000600195000098000060800060003400803001700020006060000280000419005000080079",
+  "004300209005009001070060043006002087190007400050083000600000105003508690042910300",
+  "000000907000420180000705026100904000050000040000507009920108000034059000507000000",
+  "030050040008010500460000012070502080000603000040109030250000098001020600080060020",
+  "020810740700003100090002805009040087400208003160030200302700060005600008076051090",
+  "100920000524010000000000070050008102000000000402700090060000000000030945000071006",
+  "043080250600000000000001094900004070000608000010200003820500000000000005034090710",
+  "480006902002008001900370060840010200003704100001060049020085007700900600609200018",
+  "000900002050123400030000160908000000070000090000000205091000050007439020400007000",
+  "001900003900700160030005007050000009004302600200000070600100030042007006500006800",
+};
+static const int SU_NPUZZLE = 10;
 static int su[81], suGiven[81], suCur = 0;
 static void sudokuInit() {
-  for (int i = 0; i < 81; i++) { su[i] = SU_PUZZLE[i] - '0'; suGiven[i] = su[i] != 0; }
+  const char* pz = SU_PUZZLES[random(SU_NPUZZLE)];   // pick one of ~10 boards
+  for (int i = 0; i < 81; i++) { su[i] = pz[i] - '0'; suGiven[i] = su[i] != 0; }
   suCur = 0;
 }
 static bool sudokuWon() {
@@ -1289,6 +1610,11 @@ static bool sudokuWon() {
   }
   return true;
 }
+// Sudoku layout (shared by draw + touch): 20px grid + a number-pad row at bottom.
+static const int SU_G = 20, SU_OY = 18;
+static int suOX() { return (scrW - SU_G * 9) / 2; }
+static int suPadY() { return SU_OY + SU_G * 9 + 4; }   // top of number pad
+static int suPadBW() { return scrW / 10; }
 static void sudokuDraw() {
   tft.fillScreen(C_BG);
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
@@ -1296,27 +1622,82 @@ static void sudokuDraw() {
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Sudoku", 4, 4);
   bool won = sudokuWon();
   tft.setTextColor(won ? C_TEAL : C_DIM, C_PANEL);
-  tft.drawString(won ? "SOLVED!  q=quit" : "1-9 set  WASD move  q=quit", scrW - 170, 4);
-  int G = 24, ox = (scrW - G * 9) / 2, oy = headerH + 4;
+  tft.drawString(won ? "SOLVED!" : "tap cell, tap number", 84, 4);
+  drawGameBtns();
+  int G = SU_G, ox = suOX(), oy = SU_OY;
   for (int i = 0; i < 81; i++) {
     int r = i / 9, c = i % 9, x = ox + c * G, y = oy + r * G;
     if (i == suCur) tft.fillRect(x, y, G, G, C_PANEL);
     tft.drawRect(x, y, G, G, C_DIM);
-    if (su[i]) { tft.setFreeFont(&FreeSans12pt7b); tft.setTextDatum(MC_DATUM);
+    if (su[i]) { tft.setFreeFont(&FreeSans9pt7b); tft.setTextDatum(MC_DATUM);
       tft.setTextColor(suGiven[i] ? C_INK : C_AMBER, i == suCur ? C_PANEL : C_BG);
       tft.drawString(String(su[i]), x + G / 2, y + G / 2 + 1);
       tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
     }
   }
-  // thick 3x3 separators
-  for (int k = 0; k <= 9; k += 3) {
+  for (int k = 0; k <= 9; k += 3) {                 // thick 3x3 separators
     tft.drawFastVLine(ox + k * G, oy, G * 9, C_TEAL);
     tft.drawFastHLine(ox, oy + k * G, G * 9, C_TEAL);
   }
+  // number pad: 1-9 then C(lear)
+  int ny = suPadY(), bw = suPadBW(), bh = scrH - ny - 1;
+  tft.setTextDatum(MC_DATUM);
+  for (int d = 0; d < 10; d++) {
+    int bx = d * bw;
+    tft.drawRoundRect(bx + 1, ny, bw - 2, bh, 3, C_INDIGO);
+    tft.setTextColor(d < 9 ? C_INK : C_DIM, C_BG);
+    tft.drawString(d < 9 ? String(d + 1) : "C", bx + bw / 2, ny + bh / 2);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+// --- Sliding puzzle: tiles 1..11 on a 3x4 grid, one blank; tap a tile next to
+//     the gap to slide it. Shuffled via random legal moves (always solvable). ---
+static int slide[12];
+static int slideBlank() { for (int i = 0; i < 12; i++) if (slide[i] == 0) return i; return 11; }
+static void slideInit() {
+  for (int i = 0; i < 12; i++) slide[i] = (i < 11) ? i + 1 : 0;
+  int b = 11;
+  for (int n = 0; n < 300; n++) {
+    int nb[4], c = 0, r = b / 3, col = b % 3;
+    if (r > 0) nb[c++] = b - 3; if (r < 3) nb[c++] = b + 3;
+    if (col > 0) nb[c++] = b - 1; if (col < 2) nb[c++] = b + 1;
+    int t = nb[random(c)]; slide[b] = slide[t]; slide[t] = 0; b = t;
+  }
+}
+static bool slideWon() { for (int i = 0; i < 11; i++) if (slide[i] != i + 1) return false; return slide[11] == 0; }
+static void slideGeom(int& cw, int& ch, int& ox, int& oy) { cw = 90; ch = 52; ox = (scrW - cw * 3) / 2; oy = headerH + 4; }
+static void slideDraw() {
+  tft.fillScreen(C_BG); tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Slide 1-11", 4, 4);
+  bool won = slideWon();
+  tft.setTextColor(won ? C_TEAL : C_DIM, C_PANEL); tft.drawString(won ? "SOLVED!" : "tap a tile by the gap", 96, 4);
+  drawGameBtns();
+  int cw, ch, ox, oy; slideGeom(cw, ch, ox, oy);
+  tft.setTextDatum(MC_DATUM);
+  for (int i = 0; i < 12; i++) {
+    if (slide[i] == 0) continue;
+    int x = ox + (i % 3) * cw, y = oy + (i / 3) * ch;
+    tft.fillRoundRect(x + 2, y + 2, cw - 4, ch - 4, 5, won ? C_TEAL : C_INDIGO);
+    tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_BG, won ? C_TEAL : C_INDIGO);
+    tft.drawString(String(slide[i]), x + cw / 2, y + ch / 2);
+    tft.setTextFont(1); tft.setTextSize(1);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+static void slideTap(int sx, int sy) {
+  int cw, ch, ox, oy; slideGeom(cw, ch, ox, oy);
+  if (sx < ox || sy < oy) return;
+  int c = (sx - ox) / cw, r = (sy - oy) / ch;
+  if (c < 0 || c > 2 || r < 0 || r > 3) return;
+  int idx = r * 3 + c, b = slideBlank(), br = b / 3, bc = b % 3;
+  if ((r == br && abs(c - bc) == 1) || (c == bc && abs(r - br) == 1)) { slide[b] = slide[idx]; slide[idx] = 0; slideDraw(); }
 }
 static void gameLaunch(int which) {
   gGame = which; uiMode = MODE_GAME;
-  if (which == 0) { snakeInit(); snakeDraw(); } else { sudokuInit(); sudokuDraw(); }
+  if (which == 0)      { snakeInit();  snakeDraw(); }
+  else if (which == 1) { sudokuInit(); sudokuDraw(); }
+  else                 { slideInit();  slideDraw(); }
 }
 static void gameKey(uint8_t k) {
   if (k == 'q' || k == 27) { uiMode = MODE_CHAT; draw(); return; }
@@ -1334,8 +1715,9 @@ static void gameKey(uint8_t k) {
     sudokuDraw();
   }
 }
-static void gameTick() {   // snake auto-advance
-  if (gGame == 0 && !gDead && millis() - gTickT > 170) { gTickT = millis(); snakeStep(); }
+static void gameTick() {   // snake auto-advance; starts gentle, speeds up with score
+  int period = 220 - gScore * 6; if (period < 90) period = 90;
+  if (gGame == 0 && gStarted && !gDead && millis() - gTickT > (uint32_t)period) { gTickT = millis(); snakeStep(); }
 }
 
 void loop() {
@@ -1348,8 +1730,11 @@ void loop() {
   if (shellStarted) pollShell();
 
   // real SSH server lifecycle + input marshaling (runs in its own task)
-  if (sshOn && WiFi.status() == WL_CONNECTED && !sshIsRunning()) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); sshServerStart(); }
-  else if (!sshOn && sshIsRunning()) sshServerStop();
+  if (sshOn && sshUser.length() && sshPass.length() && WiFi.status() == WL_CONNECTED) {
+    static String lastU, lastP;                      // only push creds when they change
+    if (sshUser != lastU || sshPass != lastP) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); lastU = sshUser; lastP = sshPass; }
+    if (!sshIsRunning()) sshServerStart();
+  } else if (!sshOn && sshIsRunning()) sshServerStop();
   { static bool sshWas = false; bool sa = sshActive();
     if (sa && !sshWas) { shellOut = (Print*)&sshSink; shellBanner(); shellPrompt(); }
     sshWas = sa;
@@ -1358,6 +1743,14 @@ void loop() {
   pollGps();
   if (uiMode == MODE_GAME) gameTick();
 
+  // charge-connected detection (no dedicated pin; infer from a voltage rise)
+  { static bool prevChg = false; static uint32_t chgT = 0;
+    if (now - chgT > 1500) { chgT = now;
+      bool c = batteryCharging();
+      if (c && !prevChg && uiMode == MODE_CHAT) { drawChargeSplash(); delay(1400); draw(); }
+      prevChg = c;
+    } }
+
   // trackball CLICK (GPIO0): chat -> open settings; settings -> activate selection
   bool clk = digitalRead(TB_CLICK);
   if (!clk && clkPrev && now - clkT > 220) {
@@ -1365,7 +1758,9 @@ void loop() {
     if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }
-    else activateSetting();
+    else if (uiMode == MODE_TEXT) { uiMode = textReturnMode;   // click = cancel text entry
+      if (uiMode == MODE_SETTINGS) drawSettings(); else draw(); }
+    else if (uiMode != MODE_GAME) activateSetting();   // (games handle click via their own touch)
   }
   clkPrev = clk;
 
@@ -1391,21 +1786,70 @@ void loop() {
   }
   tbUpPrev = u; tbDnPrev = d;
 
-  // TOUCH — log coords (for calibration) + hit-test
-  if (now - lastTouch > 130) {
-    int rx = 0, ry = 0;
-    if (gtReadRaw(rx, ry)) {
-      int sx, sy; gtMap(rx, ry, sx, sy);
-      Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", rx, ry, sx, sy, uiMode);
-      lastTouch = now;
+  // CALIBRATION capture: sample every loop, average a press, commit on release
+  // The GT911 "data ready" flag clears on each read, so a single poll flickers
+  // true/false while a finger is held. Debounce with hysteresis: latch the first
+  // good read as a press, act once, and only treat it as released after ~160ms
+  // with no touch. This fixes both missed quick taps and menu flip-flop.
+  {
+    static bool tPressed = false, tActed = false;
+    static uint32_t tSeen = 0, tPoll = 0; static int tRX = 0, tRY = 0;
+    int rx = 0, ry = 0; bool touched = false;
+    if (now - tPoll >= 35) { tPoll = now; touched = gtReadRaw(rx, ry); }  // throttle I2C (ESP32 headroom for WiFi/SSH)
+    if (touched) { tSeen = now; tRX = rx; tRY = ry; if (!tPressed) { tPressed = true; tActed = false; } }
+    else if (tPressed && now - tSeen > 160) tPressed = false;   // debounced release
+    bool justPressed = tPressed && !tActed;
+
+    if (uiMode == MODE_CALIB) {
+      if (justPressed) { tActed = true; Serial.printf("[cal] TAP step %d raw=%d,%d\n", calStep, tRX, tRY); calRecord(tRX, tRY); }
+    } else if (justPressed) {
+      tActed = true;
+      int sx, sy; gtMap(tRX, tRY, sx, sy);
+      Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", tRX, tRY, sx, sy, uiMode);
       if (uiMode == MODE_CHAT) {
-        if (sy < headerH && sx > scrW - 26) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
-      } else if (uiMode == MODE_MAP || uiMode == MODE_GAME) {
-        uiMode = MODE_CHAT; draw();                 // tap closes map / game
+        if (sy < 40) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // tap top ~40px = menu
+        else if (sx > scrW - 36 && sy > scrH - 26) clearChat();   // bottom-right = clear chat
+      } else if (uiMode == MODE_MAP) {
+        uiMode = MODE_CHAT; draw();                 // tap anywhere closes the map
+      } else if (uiMode == MODE_GAME) {
+        if (sy < headerH + 2 && sx > scrW - 18) { uiMode = MODE_CHAT; draw(); }   // [X] quit
+        else if (sy < headerH + 2 && sx > scrW - 54) {                            // [new] restart this game
+          if (gGame == 0) { snakeInit(); snakeDraw(); }
+          else if (gGame == 1) { sudokuInit(); sudokuDraw(); }
+          else { slideInit(); slideDraw(); }
+        }
+        else if (gGame == 0) {                      // Snake: D-pad / tap-to-steer / restart
+          if (gDead) { snakeInit(); snakeDraw(); }
+          else {
+            int dp = snakeDpadHit(sx, sy);
+            if (dp >= 0) snakeTurn(SNK_DIRS[dp][0], SNK_DIRS[dp][1]);   // D-pad button
+            else {                                                      // tap in field: steer toward it
+              int oy = headerH;
+              int hcx = snake[0].first * CELL + CELL / 2, hcy = oy + snake[0].second * CELL + CELL / 2;
+              int ddx = sx - hcx, ddy = sy - hcy;
+              if (abs(ddx) > abs(ddy)) snakeTurn(ddx > 0 ? 1 : -1, 0);
+              else                     snakeTurn(0, ddy > 0 ? 1 : -1);
+            }
+          }
+        }
+        else if (gGame == 1) {                      // Sudoku: tap cell, then tap a number
+          int G = SU_G, ox = suOX(), oy = SU_OY, ny = suPadY(), bw = suPadBW();
+          if (sy >= oy && sy < oy + G * 9 && sx >= ox && sx < ox + G * 9) {
+            suCur = ((sy - oy) / G) * 9 + (sx - ox) / G; sudokuDraw();
+          } else if (sy >= ny) {
+            int d = sx / bw;
+            if (!suGiven[suCur]) su[suCur] = (d < 9) ? d + 1 : 0;   // 1-9 or C=clear
+            sudokuDraw();
+          }
+        } else if (gGame == 2) slideTap(sx, sy);   // sliding puzzle
+      } else if (uiMode == MODE_TEXT) {
+        if (sy < headerH + 4 && sx > scrW - 18) {   // tap [X] = cancel entry
+          uiMode = textReturnMode; if (uiMode == MODE_SETTINGS) drawSettings(); else draw();
+        }
       } else if (uiMode == MODE_ABOUT) {
         uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
       } else if (uiMode == MODE_SETTINGS) {
-        setFont(1); int lh = tft.fontHeight() + 6; int row = (sy - (headerH + 4)) / lh;
+        setFont(1); int lh = tft.fontHeight() + 6; int row = setFirst + (sy - (headerH + 4)) / lh;
         if (row >= 0 && row < pageLen(setPage)) { selIdx = row; activateSetting(); }
       }
     }
@@ -1429,6 +1873,7 @@ void loop() {
       else if (k >= 32 && k < 127) { textVal += (char)k; drawText(); }
     }
     else if (uiMode == MODE_GAME) { gameKey(k); }
+    else if (uiMode == MODE_CALIB) { uiMode = MODE_CHAT; draw(); }      // any key cancels calibration
     else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }        // any key exits map
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
@@ -1452,7 +1897,7 @@ void loop() {
     if (c == '\n' || c == '\r') {
       String s = serialBuf; serialBuf = "";
       if (s == "ip")
-        Serial.printf("ip=%s status=%d mode=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode);
+        Serial.printf("ip=%s status=%d mode=%d rssi=%ddBm lvl=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode, (int)WiFi.RSSI(), wifiLevel());
       else if (s == "click") { if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
       else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
       else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
@@ -1467,5 +1912,5 @@ void loop() {
       }
     } else serialBuf += c;
   }
-  delay(8);
+  delay(15);   // ease loop rate; leaves the ESP32 more time for WiFi/SSH tasks
 }

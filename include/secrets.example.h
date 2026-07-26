@@ -16,5 +16,9 @@
 // Default provider on first boot: "anthropic" | "openai" | "gemini" | "ollama"
 #define DEFAULT_AI_PROVIDER "anthropic"
 
+// --- Remote SSH login (for `ssh <user>@<device-ip>`; also editable in Settings) ---
+#define SSH_USER "roost"
+#define SSH_PASS "roostos"
+
 // --- Maps (optional) ---
 #define GEOAPIFY_KEY ""          // https://myprojects.geoapify.com

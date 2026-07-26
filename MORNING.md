@@ -1,5 +1,29 @@
 # RoostOS Communicator — Morning Status
 
+## Session 5 (2026-07-26 pt3) — SSH, touch, more games
+Branches merged to main: **m3-ssh** (real SSH + map close/save). Open PR: **#4
+m4-touch**.
+- **Real SSH server** (LibSSH-ESP32, port 22, ED25519 host key in NVS) into the
+  shared chat/config shell. Builds/boots/listens; inbound handshake still needs
+  Wi-Fi **AP client-isolation OFF** to verify (same block as the TCP shell).
+- **Touch fixed** — root cause was a GT911 register off-by-one (point 1 X-low is
+  at 0x8150; code read p[1]|p[2]<<8 = X_high|Y_low<<8 → the classic x256 garbage).
+  Now correct + repeated-START reads. **3-point calibration wizard** (`/calibrate`,
+  Settings→Device), affine solve persisted in NVS, handles portrait→landscape
+  swap/flip. **Debounced press** (GT911 ready-flag flickers) fixes missed taps +
+  menu flip-flop. Verified: post-cal mapping accurate to a few px.
+- **Touch UI:** tap top bar = menu; **clear-chat** button + `/clear`; games close
+  via **[X]** button; **Sudoku** full touch (tap cell + number pad) with 10 boards;
+  new **Slide 1-11** puzzle. **Settings scroll** (^/v) so long pages / big fonts
+  aren't cut off.
+- Map: close via key/click/tap; last location saved to NVS and reopenable.
+
+**Verify when back:** flip AP-isolation off on SSS-FAMILY, then `ssh roost@<ip>`
+(pw roostos) and `nc <ip> 23`. Recalibrate touch if needed via Settings→Device.
+
+---
+
+
 ## Session 4 (2026-07-26 pt2) — comms, maps, games, terminal config
 Branch `m2-comms-config` (open a PR to main). All built + hardware-verified serial:
 - **Terminal chat + config** — the full interactive shell (chat with the AI + `/set`

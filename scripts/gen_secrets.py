@@ -14,6 +14,8 @@ FIXED = {
     "DEFAULT_WIFI_SSID": "SSS-FAMILY",
     "OLLAMA_HOST": "ai.senzall.net:11434",   # local Ollama (host:port)
     "DEFAULT_AI_PROVIDER": "anthropic",
+    "SSH_USER": "roost",                     # ssh <user>@<device-ip> (editable in Settings)
+    "SSH_PASS": "roostos",
 }
 
 def keychain(item):
