@@ -78,16 +78,18 @@ static bool doAuth(ssh_session session) {
   while (true) {
     ssh_message msg = ssh_message_get(session);
     if (!msg) return false;
+    int type = ssh_message_type(msg), sub = ssh_message_subtype(msg);
     bool ok = false, done = false;
-    if (ssh_message_type(msg) == SSH_REQUEST_AUTH &&
-        ssh_message_subtype(msg) == SSH_AUTH_METHOD_PASSWORD) {
+    if (type == SSH_REQUEST_SERVICE) {                 // accept the ssh-userauth service
+      ssh_message_service_reply_success(msg);
+    } else if (type == SSH_REQUEST_AUTH && sub == SSH_AUTH_METHOD_PASSWORD) {
       if (authPassword(ssh_message_auth_user(msg), ssh_message_auth_password(msg))) {
         ssh_message_auth_reply_success(msg, 0); ok = true; done = true;
       } else {
         ssh_message_auth_set_methods(msg, SSH_AUTH_METHOD_PASSWORD);
         ssh_message_reply_default(msg);
       }
-    } else {
+    } else {                                           // none / other -> advertise password
       ssh_message_auth_set_methods(msg, SSH_AUTH_METHOD_PASSWORD);
       ssh_message_reply_default(msg);
     }

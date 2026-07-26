@@ -1730,8 +1730,11 @@ void loop() {
   if (shellStarted) pollShell();
 
   // real SSH server lifecycle + input marshaling (runs in its own task)
-  if (sshOn && sshUser.length() && sshPass.length() && WiFi.status() == WL_CONNECTED && !sshIsRunning()) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); sshServerStart(); }
-  else if (!sshOn && sshIsRunning()) sshServerStop();
+  if (sshOn && sshUser.length() && sshPass.length() && WiFi.status() == WL_CONNECTED) {
+    static String lastU, lastP;                      // only push creds when they change
+    if (sshUser != lastU || sshPass != lastP) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); lastU = sshUser; lastP = sshPass; }
+    if (!sshIsRunning()) sshServerStart();
+  } else if (!sshOn && sshIsRunning()) sshServerStop();
   { static bool sshWas = false; bool sa = sshActive();
     if (sa && !sshWas) { shellOut = (Print*)&sshSink; shellBanner(); shellPrompt(); }
     sshWas = sa;
@@ -1790,9 +1793,10 @@ void loop() {
   // with no touch. This fixes both missed quick taps and menu flip-flop.
   {
     static bool tPressed = false, tActed = false;
-    static uint32_t tSeen = 0; static int tRX = 0, tRY = 0;
-    int rx = 0, ry = 0;
-    if (gtReadRaw(rx, ry)) { tSeen = now; tRX = rx; tRY = ry; if (!tPressed) { tPressed = true; tActed = false; } }
+    static uint32_t tSeen = 0, tPoll = 0; static int tRX = 0, tRY = 0;
+    int rx = 0, ry = 0; bool touched = false;
+    if (now - tPoll >= 35) { tPoll = now; touched = gtReadRaw(rx, ry); }  // throttle I2C (ESP32 headroom for WiFi/SSH)
+    if (touched) { tSeen = now; tRX = rx; tRY = ry; if (!tPressed) { tPressed = true; tActed = false; } }
     else if (tPressed && now - tSeen > 160) tPressed = false;   // debounced release
     bool justPressed = tPressed && !tActed;
 
@@ -1908,5 +1912,5 @@ void loop() {
       }
     } else serialBuf += c;
   }
-  delay(8);
+  delay(15);   // ease loop rate; leaves the ESP32 more time for WiFi/SSH tasks
 }
