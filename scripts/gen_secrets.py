@@ -3,12 +3,18 @@ import subprocess, os, sys
 
 ITEMS = {
     "ANTHROPIC_API_KEY": "anthropic_api_key_sparkshost",
+    "OPENAI_API_KEY": "OPENAI_API_KEY",     # optional (add to keychain if you use it)
+    "GEMINI_API_KEY": "GEMINI_API_KEY",     # optional
     "GEOAPIFY_KEY": "gtoapify_key_sfehost",
-    "DEFAULT_WIFI_PASS": "SSS-FAMILY",  # keychain service holding the home-WiFi password
+    "DEFAULT_WIFI_PASS": "SSS-FAMILY",       # keychain service holding the home-WiFi password
 }
-# Fixed (not a secret): the home-WiFi SSID. SSS-FAMILY is the 2.4GHz network the
-# ESP32-S3 connects to (SSS-MAIN refuses auth on the ESP32 — WPA3/MAC/enterprise).
-FIXED = { "DEFAULT_WIFI_SSID": "SSS-FAMILY" }
+# Fixed (not secrets): defaults baked in. SSS-FAMILY is the 2.4GHz network the
+# ESP32-S3 connects to (SSS-MAIN refuses auth on the ESP32 — WiFi7/WPA3).
+FIXED = {
+    "DEFAULT_WIFI_SSID": "SSS-FAMILY",
+    "OLLAMA_HOST": "ai.senzall.net:11434",   # local Ollama (host:port)
+    "DEFAULT_AI_PROVIDER": "anthropic",
+}
 
 def keychain(item):
     try:

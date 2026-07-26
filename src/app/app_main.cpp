@@ -32,12 +32,44 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 #define TB_UP       3    // scroll up
 #define TB_DOWN     15   // scroll down
 
+// Fallback defaults so an older/partial secrets.h still compiles
 #ifndef DEFAULT_WIFI_SSID
 #define DEFAULT_WIFI_SSID ""
 #endif
+#ifndef OPENAI_API_KEY
+#define OPENAI_API_KEY ""
+#endif
+#ifndef GEMINI_API_KEY
+#define GEMINI_API_KEY ""
+#endif
+#ifndef OLLAMA_HOST
+#define OLLAMA_HOST ""
+#endif
+#ifndef DEFAULT_AI_PROVIDER
+#define DEFAULT_AI_PROVIDER "anthropic"
+#endif
 
-static const char* ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
-static const char* MODEL = "claude-haiku-4-5";
+static const char* SYS_PROMPT =
+  "You are RoostOS, a friendly assistant on a small handheld device with a tiny "
+  "pixel-font screen. Reply in plain ASCII text only: no markdown, no headings, "
+  "no bullet symbols, no emoji, no special/unicode characters. Keep replies short.";
+
+static const char* PROVIDERS[] = {"anthropic", "openai", "gemini", "ollama"};
+static const int NPROV = 4;
+static String defaultModel(const String& p) {
+  if (p == "openai") return "gpt-4o-mini";
+  if (p == "gemini") return "gemini-2.0-flash-lite";   // small/cheap (demo key)
+  if (p == "ollama") return "llama3.2";
+  return "claude-haiku-4-5";
+}
+// A provider is selectable only if its key/host is configured (in secrets.h).
+static bool providerConfigured(const String& p) {
+  if (p == "anthropic") return strlen(ANTHROPIC_API_KEY) > 0;
+  if (p == "openai")    return strlen(OPENAI_API_KEY) > 0;
+  if (p == "gemini")    return strlen(GEMINI_API_KEY) > 0;
+  if (p == "ollama")    return strlen(OLLAMA_HOST) > 0;
+  return false;
+}
 
 TFT_eSPI tft = TFT_eSPI();
 static uint16_t C_BG, C_PANEL, C_INK, C_DIM, C_TEAL, C_INDIGO, C_AMBER;
@@ -62,6 +94,8 @@ static int inputFontIdx = 1;   // input-box text size (default small)
 static uint16_t userColor, aiColor;   // set in setup(); configurable
 static int splashMs   = 3500;  // boot splash duration
 static int scrollStep = 2;     // lines per trackball detent (adjustable "rate")
+static String aiProvider = DEFAULT_AI_PROVIDER;   // anthropic|openai|gemini|ollama
+static String aiModel = "";                        // set from NVS / provider default
 
 static void saveCfg() {
   prefs.begin("roostcomm", false);
@@ -71,6 +105,8 @@ static void saveCfg() {
   prefs.putUShort("aiCol", aiColor);
   prefs.putInt("splashMs", splashMs);
   prefs.putInt("scrollStep", scrollStep);
+  prefs.putString("aiProv", aiProvider);
+  prefs.putString("aiModel", aiModel);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -81,6 +117,8 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   aiColor      = prefs.getUShort("aiCol", aiColor);
   splashMs     = prefs.getInt("splashMs", splashMs);
   scrollStep   = prefs.getInt("scrollStep", scrollStep);
+  aiProvider   = prefs.getString("aiProv", aiProvider);
+  aiModel      = prefs.getString("aiModel", defaultModel(aiProvider));
   prefs.end();
 }
 
@@ -290,50 +328,114 @@ static void activateSetting() {
   saveCfg(); drawSettings();
 }
 
-static String askClaude(const String& prompt) {
+// POST JSON to a URL (secure=true for https). Up to 2 extra headers. Returns the
+// response body, or "" with *err set. Client objects stay alive across the POST.
+static String httpPostJSON(bool secure, const String& url, const String& body,
+                           const char* h1n, const char* h1v,
+                           const char* h2n, const char* h2v, String& err) {
+  WiFiClientSecure tls; WiFiClient plain;
+  HTTPClient http; http.setTimeout(25000);
+  bool ok;
+  if (secure) { tls.setInsecure(); ok = http.begin(tls, url); }
+  else        { ok = http.begin(plain, url); }
+  if (!ok) { err = "begin failed"; return ""; }
+  http.addHeader("content-type", "application/json");
+  if (h1n) http.addHeader(h1n, h1v);
+  if (h2n) http.addHeader(h2n, h2v);
+  int code = http.POST(body);
+  String payload = http.getString();
+  http.end();
+  if (code <= 0) { err = String("net ") + http.errorToString(code); return ""; }
+  return payload;   // caller inspects for API-level errors
+}
+
+// Ask the currently-selected AI provider. Returns reply text (or an "[error] ..." string).
+static String askAI(const String& prompt) {
   if (WiFi.status() != WL_CONNECTED) return "[error] WiFi not connected";
-  WiFiClientSecure tls; tls.setInsecure();
-  HTTPClient https; https.setTimeout(20000);
-  if (!https.begin(tls, ANTHROPIC_URL)) return "[error] https.begin failed";
-  https.addHeader("content-type", "application/json");
-  https.addHeader("x-api-key", ANTHROPIC_API_KEY);
-  https.addHeader("anthropic-version", "2023-06-01");
-  JsonDocument req;
-  req["model"] = MODEL; req["max_tokens"] = 400;
-  req["system"] =
-    "You are RoostOS, a friendly assistant on a small handheld device with a tiny "
-    "pixel-font screen. Reply in plain ASCII text only: no markdown, no headings, "
-    "no bullet symbols, no emoji, no special/unicode characters. Keep replies short.";
-  JsonArray a = req["messages"].to<JsonArray>();
-  JsonObject m = a.add<JsonObject>(); m["role"] = "user"; m["content"] = prompt;
-  String body; serializeJson(req, body);
-  int code = https.POST(body);
-  String payload = https.getString(); https.end();
-  if (code <= 0) return String("[error] POST failed: ") + https.errorToString(code);
-  JsonDocument resp;
-  if (deserializeJson(resp, payload)) return String("[error] bad JSON HTTP ") + code;
-  if (resp["type"] == "error")
-    return String("[api ") + (const char*)(resp["error"]["type"] | "error") + "] " +
-           (const char*)(resp["error"]["message"] | "");
-  String text;
-  for (JsonObject b : resp["content"].as<JsonArray>())
-    if (b["type"] == "text") text += (const char*)(b["text"] | "");
-  return text.isEmpty() ? String("[no text]") : text;
+  String err, p;
+  JsonDocument r;
+
+  if (aiProvider == "anthropic") {
+    if (!strlen(ANTHROPIC_API_KEY)) return "[no Anthropic key — set in secrets.h]";
+    JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 400; req["system"] = SYS_PROMPT;
+    JsonObject m = req["messages"].to<JsonArray>().add<JsonObject>(); m["role"] = "user"; m["content"] = prompt;
+    String body; serializeJson(req, body);
+    p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
+                     "x-api-key", ANTHROPIC_API_KEY, "anthropic-version", "2023-06-01", err);
+    if (p == "") return "[error] " + err;
+    if (deserializeJson(r, p)) return "[bad JSON]";
+    if (r["type"] == "error") return String("[api] ") + (const char*)(r["error"]["message"] | "");
+    String t; for (JsonObject b : r["content"].as<JsonArray>()) if (b["type"] == "text") t += (const char*)(b["text"] | "");
+    return t.length() ? t : "[no text]";
+  }
+  if (aiProvider == "openai") {
+    if (!strlen(OPENAI_API_KEY)) return "[no OpenAI key — set in secrets.h]";
+    JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 400;
+    JsonArray a = req["messages"].to<JsonArray>();
+    JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = SYS_PROMPT;
+    JsonObject u = a.add<JsonObject>(); u["role"] = "user"; u["content"] = prompt;
+    String body; serializeJson(req, body);
+    String auth = String("Bearer ") + OPENAI_API_KEY;
+    p = httpPostJSON(true, "https://api.openai.com/v1/chat/completions", body,
+                     "authorization", auth.c_str(), nullptr, nullptr, err);
+    if (p == "") return "[error] " + err;
+    if (deserializeJson(r, p)) return "[bad JSON]";
+    if (r["error"]) return String("[api] ") + (const char*)(r["error"]["message"] | "");
+    return String((const char*)(r["choices"][0]["message"]["content"] | "[no text]"));
+  }
+  if (aiProvider == "gemini") {
+    if (!strlen(GEMINI_API_KEY)) return "[no Gemini key — set in secrets.h]";
+    JsonDocument req;
+    req["systemInstruction"]["parts"][0]["text"] = SYS_PROMPT;
+    JsonObject u = req["contents"].to<JsonArray>().add<JsonObject>();
+    u["role"] = "user"; u["parts"][0]["text"] = prompt;
+    req["generationConfig"]["maxOutputTokens"] = 400;
+    String body; serializeJson(req, body);
+    String url = String("https://generativelanguage.googleapis.com/v1beta/models/") +
+                 aiModel + ":generateContent?key=" + GEMINI_API_KEY;
+    p = httpPostJSON(true, url, body, nullptr, nullptr, nullptr, nullptr, err);
+    if (p == "") return "[error] " + err;
+    if (deserializeJson(r, p)) return "[bad JSON]";
+    if (r["error"]) return String("[api] ") + (const char*)(r["error"]["message"] | "");
+    return String((const char*)(r["candidates"][0]["content"]["parts"][0]["text"] | "[no text]"));
+  }
+  if (aiProvider == "ollama") {
+    if (!strlen(OLLAMA_HOST)) return "[set Ollama host in secrets.h]";
+    JsonDocument req; req["model"] = aiModel; req["stream"] = false;
+    JsonArray a = req["messages"].to<JsonArray>();
+    JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = SYS_PROMPT;
+    JsonObject u = a.add<JsonObject>(); u["role"] = "user"; u["content"] = prompt;
+    String body; serializeJson(req, body);
+    p = httpPostJSON(false, String("http://") + OLLAMA_HOST + "/api/chat", body,
+                     nullptr, nullptr, nullptr, nullptr, err);
+    if (p == "") return "[error] " + err;
+    if (deserializeJson(r, p)) return "[bad JSON]";
+    return String((const char*)(r["message"]["content"] | "[no text]"));
+  }
+  return "[unknown provider: " + aiProvider + "]";
+}
+
+static String aiLabel() {
+  if (aiProvider == "openai") return "GPT";
+  if (aiProvider == "gemini") return "Gemini";
+  if (aiProvider == "ollama") return "Ollama";
+  return "Haiku";
 }
 
 static void sendPrompt(const String& prompt) {
   scrollLines = 0;
+  String lbl = aiLabel() + ": ";
   addMsg("You: " + prompt, userColor);
   addMsg("...", C_DIM); draw();
-  String reply = askClaude(prompt);
-  Serial.print("Haiku: "); Serial.println(reply);
+  String reply = askAI(prompt);
+  Serial.println(lbl + reply);
   if (!msgs.empty()) msgs.pop_back();       // remove "..."
-  addMsg("Haiku: " + reply, aiColor);
+  addMsg(lbl + reply, aiColor);
   // show YOUR message at the top of the new exchange (scroll down for long replies)
   setFont(chatFontIdx);
   std::vector<String> ex;
   wrapMsg("You: " + prompt, scrW - 4, ex);
-  wrapMsg("Haiku: " + reply, scrW - 4, ex);
+  wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
 }
@@ -453,6 +555,28 @@ static int fontArgToIdx(const String& arg, int cur) {
   return pt <= 6 ? 0 : (pt <= 10 ? 1 : (pt <= 15 ? 2 : 3));
 }
 
+// Is the Ollama host answering? (quick GET /api/tags with short timeouts)
+static bool ollamaReachable() {
+  if (!strlen(OLLAMA_HOST)) return false;
+  WiFiClient c; HTTPClient h;
+  h.setConnectTimeout(3000); h.setTimeout(4000);
+  if (!h.begin(c, String("http://") + OLLAMA_HOST + "/api/tags")) return false;
+  int code = h.GET(); h.end();
+  return code == 200;
+}
+// Verify-then-switch: only change the active provider if it's configured and (for
+// local Ollama) actually reachable. Returns success; sets msg for display.
+static bool switchProvider(const String& p, String& msg) {
+  bool valid = false; for (int i = 0; i < NPROV; i++) if (p == PROVIDERS[i]) valid = true;
+  if (!valid) { msg = "unknown provider"; return false; }
+  if (!providerConfigured(p)) { msg = "no key for " + p; return false; }
+  if (p == "ollama" && WiFi.status() == WL_CONNECTED && !ollamaReachable()) {
+    msg = "ollama unreachable @ " + String(OLLAMA_HOST); return false;
+  }
+  aiProvider = p; aiModel = defaultModel(p); saveCfg();
+  msg = "provider: " + aiProvider + " / " + aiModel; return true;
+}
+
 // command matches full name OR a >=3-char prefix (so /fon, /set, /col, /scr, /spl, /inp work)
 static bool cmdIs(const String& tok, const char* full) {
   String f = full;
@@ -479,6 +603,12 @@ static String applyCfgCmd(String s) {
   }
   if (cmdIs(tok, "scroll")) { scrollStep = constrain(rest.toInt(), 1, 20); saveCfg(); return String("scroll rate: ") + scrollStep; }
   if (cmdIs(tok, "splash")) { splashMs = constrain(rest.toInt(), 0, 15000); saveCfg(); return String("splash: ") + splashMs + "ms"; }
+  if (cmdIs(tok, "provider")) {
+    String v = rest; v.toLowerCase();
+    if (v.isEmpty()) return "providers: anthropic openai gemini ollama";
+    String m; switchProvider(v, m); return m;
+  }
+  if (cmdIs(tok, "model")) { if (rest.length()) { aiModel = rest; saveCfg(); } return String("model: ") + aiModel; }
   return "";
 }
 
