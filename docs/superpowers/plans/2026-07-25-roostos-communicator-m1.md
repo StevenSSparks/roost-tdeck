@@ -122,6 +122,8 @@ git push -u origin main
 // time from the macOS keychain by scripts/gen_secrets.py and is gitignored.
 #define ANTHROPIC_API_KEY ""
 #define GEOAPIFY_KEY ""
+#define DEFAULT_WIFI_SSID ""
+#define DEFAULT_WIFI_PASS ""
 ```
 
 - [ ] **Step 2: Write `scripts/gen_secrets.py`**
@@ -133,7 +135,10 @@ import subprocess, os, sys
 ITEMS = {
     "ANTHROPIC_API_KEY": "anthropic_api_key_sparkshost",
     "GEOAPIFY_KEY": "gtoapify_key_sfehost",
+    "DEFAULT_WIFI_PASS": "SSS-MAIN",  # keychain service holding the home-WiFi password
 }
+# Fixed (not a secret): the home-WiFi SSID matches the keychain service name.
+FIXED = { "DEFAULT_WIFI_SSID": "SSS-MAIN" }
 
 def keychain(item):
     try:
@@ -151,6 +156,8 @@ for macro, item in ITEMS.items():
     val = keychain(item)
     if val is None:
         missing.append(item); val = ""
+    lines.append(f'#define {macro} "{val}"')
+for macro, val in FIXED.items():
     lines.append(f'#define {macro} "{val}"')
 
 if missing:
@@ -652,7 +659,7 @@ Expected: builds clean.
 - Consumes: `configToKV`/`configFromKV` (Task 4).
 - Produces: `AppConfig settingsLoad();` (reads each KV key from `Preferences`, applies `configFromKV`, seeds from `secrets.h` under `DEV_SECRETS` when the stored key is empty), `void settingsSave(const AppConfig&);`, plus saved-WiFi and saved-MAC list helpers: `std::vector<std::pair<String,String>> savedNetworks();` `void saveNetwork(String ssid,String pass);` `std::vector<String> savedMacs(); void saveMac(String);`.
 
-- [ ] **Step 1:** Implement over `Preferences` (namespace `"roostcomm"`). On load, if `anthropicKey`/`geoapifyKey` empty and `DEV_SECRETS` defined, seed from `ANTHROPIC_API_KEY`/`GEOAPIFY_KEY` and persist.
+- [ ] **Step 1:** Implement over `Preferences` (namespace `"roostcomm"`). On load, if `anthropicKey`/`geoapifyKey` empty and `DEV_SECRETS` defined, seed from `ANTHROPIC_API_KEY`/`GEOAPIFY_KEY` and persist. Also, when `DEV_SECRETS` is defined, `savedNetworks()` is empty, and `DEFAULT_WIFI_SSID` is non-empty, seed one saved network via `saveNetwork(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS)` so the device auto-joins the home network on first boot.
 - [ ] **On-device acceptance:** serial prints loaded model/theme; after `settingsSave` with a changed persona, a reboot shows the new persona. With `DEV_SECRETS`, keys are non-empty on first boot.
 - [ ] **Step 2: Commit** — `git commit -am "feat(cfg): NVS settings store + keychain seed"`.
 
@@ -843,3 +850,25 @@ Expected: builds clean.
 **Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". Hardware tasks specify on-device acceptance instead of native code (cannot run under `native`); pins sourced from LILYGO in T11/HARDWARE.md; battery health and radio params are explicitly labeled estimates/"not active" rather than implying capabilities the hardware lacks.
 
 **Type consistency:** `AppConfig`, `ChatHistory`, `ParsedResponse`/`ToolCall`, `UsageStats`, `GpsFix`, `Battery`, `RadioStatus`, `dispatchTool`, `geoapifyStaticUrl`, `applyTheme`, `setSoundsEnabled`, `setDisplayBrightness`, `setKeyboardBacklight`, `setMapTarget`, and the `wifi*` getters are used identically across producing and consuming tasks. Screen ids (`chat/wifi/gps/system/settings`) match T22's `uiShow` set.
+
+---
+
+## Design Addendum (folded from live build session, 2026-07-25 night)
+
+These supersede/extend the tasks noted. Authoritative for implementation.
+
+**A. Input (revises Task 13).** TOUCH is the PRIMARY input — capacitive GT911 on the shared I2C bus, INT on GPIO16 — wired as an LVGL pointer indev (direct touch, no cursor image needed). Keyboard (I2C 0x55) is the text indev. The **trackball is OPTIONAL and OFF by default** (Settings toggle); only when enabled does it drive a pointer, and only then is an arrow cursor image relevant. Drive Settings/menus with touch. The "real arrow cursor / no emoji" requirement applies only to the optional trackball-pointer mode.
+
+**B. WiFi provisioning (revises Task 2/17/18).** Device network is **SSS-FAMILY** (2.4GHz, VLAN52) — proven working. SSS-MAIN refuses auth on ESP32 (WiFi7/WPA3). Seed BOTH **SSS-FAMILY (primary)** and **SSS-IOT (secondary)** as saved networks; `gen_secrets.py` should emit `DEFAULT_WIFI2_SSID="SSS-IOT"` + `DEFAULT_WIFI2_PASS` (keychain item `SSS-IOT`). WiFi manager tries saved nets in order.
+
+**C. System-prompt context bundle (revises Task 7 buildRequestBody / Task 20 claude_client / Task 25 settings).** Add to `AppConfig`: `userName`, `timezone`, and toggles `injectContext` (default on), `webSearchEnabled`. When building the request `system`, prepend a context block when enabled: the user's name, the current LOCAL date/time (from **GPS UTC** converted via `timezone`, fallback NTP), and optionally the current location. This makes Haiku name-aware and time-aware. All fields set in Settings.
+
+**D. Web search tool (adds a 5th device tool).** Optional `web_search` tool (Settings toggle `webSearchEnabled`) implemented via the **DuckDuckGo Instant Answer API** (`https://api.duckduckgo.com/?q=...&format=json&no_html=1`), returning the abstract/answer text as the tool_result. Add to `tools_schema` (gated by the toggle) and `device_tools` dispatch.
+
+**E. Dev Bridge / remote shell (new task, may default ON — configurable).** A command shell exposing `ask <text>`/`claude <text>`, `ip`, `status`, `wifi`, `scan`, `gps`, `bat`, `reboot`, `clearchat` over: (1) USB serial (always), (2) TCP port 23 (LAN, Settings toggle), and later (3) real SSH via `libssh_esp32` (Settings toggle, may default on). This is the on-device backdoor. The proven `src/smoke/` firmware is the prototype; the real Dev Bridge wraps the same commands around the real modules.
+
+**F. Configurability principle.** Every user-facing behavior above is a Settings field/toggle (name, timezone, context injection, web search, trackball on/off, sounds, theme, brightness, KB backlight, sleep, SSH/TCP shell, bridge cap).
+
+**G. Fun backlog (post-M1).** On-device games (e.g., Sudoku) — the real reason the trackball exists; "use latest Haiku" via Models API auto-detect.
+
+**H. Verified milestone.** Full pipeline proven on hardware via `src/smoke/` (env:smoke): board power → WiFi(SSS-FAMILY) → TLS → Anthropic Haiku → parsed reply, auto-connecting on boot from keychain-provisioned secrets. Serial + TCP:23 `ask`/`claude` shell working.
