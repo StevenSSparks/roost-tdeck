@@ -217,7 +217,7 @@ static int uiMode = MODE_CHAT;
 static int selIdx = 0;
 // Settings are organized as a main page with per-category sub-pages (BlackBerry
 // style: <=6 options each, item 0 is always Back). selIdx indexes the current page.
-enum { PG_MAIN, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_COUNT };
+enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_COUNT };
 static int setPage = PG_MAIN;
 static String setMsg = "";   // transient status line (e.g. provider switch result)
 static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
@@ -334,6 +334,7 @@ static bool joinWifi(const String& ssid, const String& pass);
 static String activeSsid();
 static void draw();
 static void showMap(double lat, double lon, int zoom);
+static void gameLaunch(int which);
 
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
@@ -342,11 +343,19 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
   switch (pg) {
     case PG_MAIN:
       row("Back to chat", "");
+      row("Apps", ">");
       row("Display", ">"); row("Colors", ">");
       row("AI Provider", aiProvider);
       row("Device", ">");
       row("System / About", ">");
       return "Settings";
+    case PG_APPS:
+      row("< Back", "");
+      row("Map", locValid ? "gps" : "no fix");
+      row("Snake", ">");
+      row("Sudoku", ">");
+      row("GPS status", locValid ? String(locLat, 3) + "," + String(locLon, 3) : String("no fix"));
+      return "Apps";
     case PG_DEVICE:
       row("< Back", "");
       row("Your name", userName.length() ? userName : String("(set)"));
@@ -507,11 +516,12 @@ static void activateSetting() {
   if (setPage == PG_MAIN) {
     switch (selIdx) {
       case 0: uiMode = MODE_CHAT; draw(); return;         // Back to chat
-      case 1: setPage = PG_DISPLAY; selIdx = 0; break;
-      case 2: setPage = PG_COLORS;  selIdx = 0; break;
-      case 3: setPage = PG_AI;      selIdx = 0; break;
-      case 4: setPage = PG_DEVICE;  selIdx = 0; break;
-      case 5: setPage = PG_SYSTEM;  selIdx = 0; break;
+      case 1: setPage = PG_APPS;    selIdx = 0; break;
+      case 2: setPage = PG_DISPLAY; selIdx = 0; break;
+      case 3: setPage = PG_COLORS;  selIdx = 0; break;
+      case 4: setPage = PG_AI;      selIdx = 0; break;
+      case 5: setPage = PG_DEVICE;  selIdx = 0; break;
+      case 6: setPage = PG_SYSTEM;  selIdx = 0; break;
     }
     drawSettings(); return;
   }
@@ -519,6 +529,15 @@ static void activateSetting() {
   if (selIdx == 0) { setPage = PG_MAIN; selIdx = 0; drawSettings(); return; }
 
   switch (setPage) {
+    case PG_APPS:
+      switch (selIdx) {
+        case 1: if (locValid) { showMap(locLat, locLon, 14); return; }
+                setMsg = "no GPS fix; use /map <lat> <lon>"; break;
+        case 2: gameLaunch(0); return;   // Snake
+        case 3: gameLaunch(1); return;   // Sudoku
+        case 4: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
+      }
+      break;
     case PG_DISPLAY:
       switch (selIdx) {
         case 1: chatFontIdx  = (chatFontIdx + 1) % NFONTS; break;
@@ -925,6 +944,12 @@ static String applyCfgCmd(String s) {
     else if (!locValid) return "no GPS fix yet - try: map <lat> <lon>";
     showMap(la, lo, 14); return "map";
   }
+  if (tok == "game") { String g = rest; g.toLowerCase();
+    if (g.startsWith("sn")) { gameLaunch(0); return "snake"; }
+    if (g.startsWith("su")) { gameLaunch(1); return "sudoku"; }
+    return "game: snake | sudoku"; }
+  if (tok == "snake")  { gameLaunch(0); return "snake"; }
+  if (tok == "sudoku") { gameLaunch(1); return "sudoku"; }
   if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
   if (cmdIs(tok, "key")) {   // /key anthropic|openai|gemini <api-key>
     int p = rest.indexOf(' ');
@@ -1104,6 +1129,125 @@ static void pollShell() {
   }
 }
 
+// ============================================================================
+//  Games: Snake (trackball/WASD) + Sudoku (QWERTY). MODE_GAME; Esc/q = back.
+// ============================================================================
+static int gGame = 0;               // 0 = snake, 1 = sudoku
+// --- Snake ---
+static const int CELL = 12;
+static int gCols, gRows;
+static std::vector<std::pair<int,int>> snake;
+static int sdx = 1, sdy = 0, ndx = 1, ndy = 0, gScore = 0;
+static bool gDead = false;
+static uint32_t gTickT = 0;
+static void placeFood(int& fx, int& fy) {
+  bool ok; do { ok = true; fx = random(gCols); fy = random(gRows);
+    for (auto& s : snake) if (s.first == fx && s.second == fy) ok = false;
+  } while (!ok);
+}
+static int gFoodX, gFoodY;
+static void snakeInit() {
+  gCols = scrW / CELL; gRows = (scrH - headerH) / CELL;
+  snake.clear(); snake.push_back({gCols / 2, gRows / 2});
+  sdx = ndx = 1; sdy = ndy = 0; gScore = 0; gDead = false;
+  placeFood(gFoodX, gFoodY); gTickT = millis();
+}
+static void snakeDraw() {
+  tft.fillScreen(C_BG);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Snake", 4, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 60, 4);
+  tft.setTextColor(C_DIM, C_PANEL); tft.drawString(gDead ? "DEAD - any key" : "ball/WASD  q=quit", scrW - 130, 4);
+  int oy = headerH;
+  tft.fillRect(gFoodX * CELL, oy + gFoodY * CELL, CELL - 1, CELL - 1, C_AMBER);
+  for (size_t i = 0; i < snake.size(); i++)
+    tft.fillRect(snake[i].first * CELL, oy + snake[i].second * CELL, CELL - 1, CELL - 1, i == 0 ? C_TEAL : C_INDIGO);
+}
+static void snakeStep() {
+  if (gDead) return;
+  sdx = ndx; sdy = ndy;
+  int hx = snake[0].first + sdx, hy = snake[0].second + sdy;
+  if (hx < 0 || hy < 0 || hx >= gCols || hy >= gRows) { gDead = true; snakeDraw(); return; }
+  for (auto& s : snake) if (s.first == hx && s.second == hy) { gDead = true; snakeDraw(); return; }
+  snake.insert(snake.begin(), {hx, hy});
+  if (hx == gFoodX && hy == gFoodY) { gScore++; placeFood(gFoodX, gFoodY); }
+  else snake.pop_back();
+  snakeDraw();
+}
+static void snakeTurn(int dx, int dy) {   // ignore 180-degree reversals
+  if (dx == -sdx && dy == -sdy) return;
+  ndx = dx; ndy = dy;
+}
+// --- Sudoku ---
+static const char* SU_PUZZLE =
+  "530070000600195000098000060800060003400803001700020006060000280000419005000080079";
+static int su[81], suGiven[81], suCur = 0;
+static void sudokuInit() {
+  for (int i = 0; i < 81; i++) { su[i] = SU_PUZZLE[i] - '0'; suGiven[i] = su[i] != 0; }
+  suCur = 0;
+}
+static bool sudokuWon() {
+  for (int i = 0; i < 81; i++) if (su[i] == 0) return false;
+  for (int r = 0; r < 9; r++) for (int a = 0; a < 9; a++) for (int b = a + 1; b < 9; b++) {
+    if (su[r*9+a] == su[r*9+b]) return false;      // row
+    if (su[a*9+r] == su[b*9+r]) return false;      // col
+  }
+  for (int br = 0; br < 9; br += 3) for (int bc = 0; bc < 9; bc += 3) {
+    int seen[10] = {0};
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { int v = su[(br+r)*9 + bc+c]; if (seen[v]++) return false; }
+  }
+  return true;
+}
+static void sudokuDraw() {
+  tft.fillScreen(C_BG);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Sudoku", 4, 4);
+  bool won = sudokuWon();
+  tft.setTextColor(won ? C_TEAL : C_DIM, C_PANEL);
+  tft.drawString(won ? "SOLVED!  q=quit" : "1-9 set  WASD move  q=quit", scrW - 170, 4);
+  int G = 24, ox = (scrW - G * 9) / 2, oy = headerH + 4;
+  for (int i = 0; i < 81; i++) {
+    int r = i / 9, c = i % 9, x = ox + c * G, y = oy + r * G;
+    if (i == suCur) tft.fillRect(x, y, G, G, C_PANEL);
+    tft.drawRect(x, y, G, G, C_DIM);
+    if (su[i]) { tft.setFreeFont(&FreeSans12pt7b); tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(suGiven[i] ? C_INK : C_AMBER, i == suCur ? C_PANEL : C_BG);
+      tft.drawString(String(su[i]), x + G / 2, y + G / 2 + 1);
+      tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+    }
+  }
+  // thick 3x3 separators
+  for (int k = 0; k <= 9; k += 3) {
+    tft.drawFastVLine(ox + k * G, oy, G * 9, C_TEAL);
+    tft.drawFastHLine(ox, oy + k * G, G * 9, C_TEAL);
+  }
+}
+static void gameLaunch(int which) {
+  gGame = which; uiMode = MODE_GAME;
+  if (which == 0) { snakeInit(); snakeDraw(); } else { sudokuInit(); sudokuDraw(); }
+}
+static void gameKey(uint8_t k) {
+  if (k == 'q' || k == 27) { uiMode = MODE_CHAT; draw(); return; }
+  if (gGame == 0) {   // snake
+    if (gDead) { snakeInit(); snakeDraw(); return; }
+    if (k == 'w') snakeTurn(0, -1); else if (k == 's') snakeTurn(0, 1);
+    else if (k == 'a') snakeTurn(-1, 0); else if (k == 'd') snakeTurn(1, 0);
+  } else {            // sudoku
+    if (k == 'w' && suCur >= 9) suCur -= 9;
+    else if (k == 's' && suCur < 72) suCur += 9;
+    else if (k == 'a' && suCur % 9) suCur--;
+    else if (k == 'd' && suCur % 9 != 8) suCur++;
+    else if (k >= '1' && k <= '9') { if (!suGiven[suCur]) su[suCur] = k - '0'; }
+    else if (k == '0' || k == ' ' || k == 8 || k == 127) { if (!suGiven[suCur]) su[suCur] = 0; }
+    sudokuDraw();
+  }
+}
+static void gameTick() {   // snake auto-advance
+  if (gGame == 0 && !gDead && millis() - gTickT > 170) { gTickT = millis(); snakeStep(); }
+}
+
 void loop() {
   static bool clkPrev = true; static uint32_t clkT = 0, lastTouch = 0;
   uint32_t now = millis();
@@ -1113,6 +1257,7 @@ void loop() {
   else if ((!remoteShellOn || WiFi.status() != WL_CONNECTED) && shellStarted) { if (shellClient) shellClient.stop(); shellServer.end(); shellStarted = false; }
   if (shellStarted) pollShell();
   pollGps();
+  if (uiMode == MODE_GAME) gameTick();
 
   // trackball CLICK (GPIO0): chat -> open settings; settings -> activate selection
   bool clk = digitalRead(TB_CLICK);
@@ -1137,6 +1282,12 @@ void loop() {
     } else if (uiMode == MODE_SETTINGS) {
       if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); lastScroll = now; drawSettings(); }
       if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % pageLen(setPage); lastScroll = now; drawSettings(); }
+    } else if (uiMode == MODE_GAME && gGame == 0) {   // snake steering
+      bool lft = digitalRead(1), rgt = digitalRead(2);   // TB_LEFT=GPIO1, TB_RIGHT=GPIO2
+      if (!u && tbUpPrev) snakeTurn(0, -1);
+      if (!d && tbDnPrev) snakeTurn(0, 1);
+      if (!lft) snakeTurn(-1, 0);
+      if (!rgt) snakeTurn(1, 0);
     }
   }
   tbUpPrev = u; tbDnPrev = d;
@@ -1176,6 +1327,7 @@ void loop() {
       } else if (k == 8 || k == 127) { if (textVal.length()) textVal.remove(textVal.length() - 1); drawText(); }
       else if (k >= 32 && k < 127) { textVal += (char)k; drawText(); }
     }
+    else if (uiMode == MODE_GAME) { gameKey(k); }
     else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }        // any key exits map
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
