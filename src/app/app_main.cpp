@@ -12,9 +12,12 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <Preferences.h>
 #include <vector>
 #include "secrets.h"
 #include "version.h"
+
+static Preferences prefs;
 
 // ---- pins ----
 #define PIN_POWERON 10
@@ -55,6 +58,29 @@ static void setFont(int idx) {
 static int chatFontIdx  = 1;   // message text size (default small = FreeSans 9pt)
 static int inputFontIdx = 1;   // input-box text size (default small)
 static uint16_t userColor, aiColor;   // set in setup(); configurable
+static int splashMs   = 3500;  // boot splash duration
+static int scrollStep = 2;     // lines per trackball detent (adjustable "rate")
+
+static void saveCfg() {
+  prefs.begin("roostcomm", false);
+  prefs.putInt("chatFont", chatFontIdx);
+  prefs.putInt("inputFont", inputFontIdx);
+  prefs.putUShort("userCol", userColor);
+  prefs.putUShort("aiCol", aiColor);
+  prefs.putInt("splashMs", splashMs);
+  prefs.putInt("scrollStep", scrollStep);
+  prefs.end();
+}
+static void loadCfg() {   // call AFTER colors + defaults are set
+  prefs.begin("roostcomm", true);
+  chatFontIdx  = prefs.getInt("chatFont", chatFontIdx);
+  inputFontIdx = prefs.getInt("inputFont", inputFontIdx);
+  userColor    = prefs.getUShort("userCol", userColor);
+  aiColor      = prefs.getUShort("aiCol", aiColor);
+  splashMs     = prefs.getInt("splashMs", splashMs);
+  scrollStep   = prefs.getInt("scrollStep", scrollStep);
+  prefs.end();
+}
 
 // named color lookup
 static uint16_t namedColor(const String& n) {
@@ -210,12 +236,7 @@ static void sendPrompt(const String& prompt) {
   Serial.print("Haiku: "); Serial.println(reply);
   if (!msgs.empty()) msgs.pop_back();       // remove "..."
   addMsg("Haiku: " + reply, aiColor);
-  // anchor: keep the user's message visible at the top of the new exchange
-  setFont(chatFontIdx);
-  std::vector<String> ex;
-  wrapMsg("You: " + prompt, scrW - 4, ex);
-  wrapMsg("Haiku: " + reply, scrW - 4, ex);
-  scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
+  scrollLines = 0;   // show the newest content (end of reply); roll trackball up for history
   draw();
 }
 
@@ -273,11 +294,11 @@ void setup() {
   C_TEAL   = tft.color565(0x34, 0xe2, 0xc0);
   C_INDIGO = tft.color565(0x7c, 0x8c, 0xff);
   C_AMBER  = tft.color565(0xff, 0xbe, 0x4d);
-  userColor = C_INDIGO;   // configurable
-  aiColor   = C_TEAL;     // configurable
+  userColor = C_INDIGO; aiColor = C_TEAL;   // defaults
+  loadCfg();                                 // override from saved settings (NVS)
 
   drawSplash();
-  delay(3500);   // linger so the splash is enjoyable / photographable (Settings option later)
+  delay(splashMs);   // adjustable in settings
 
   int save = chatFontIdx; chatFontIdx = 0;   // boot in tiny so startup lines fit
   addMsg("Booting... connecting WiFi", C_DIM); draw();
@@ -293,6 +314,7 @@ void setup() {
 
 static String serialBuf;
 static bool tbUpPrev = true, tbDnPrev = true;
+static uint32_t lastScroll = 0;
 
 static int fontArgToIdx(const String& arg, int cur) {
   if (arg == "tiny") return 0; if (arg == "small") return 1;
@@ -312,8 +334,10 @@ void loop() {
   // trackball scroll (falling edge = one detent)
   bool u = digitalRead(TB_UP), d = digitalRead(TB_DOWN);
   int beforeScroll = scrollLines;
-  if (u != tbUpPrev) scrollLines += 2;   // any edge = one detent (more responsive)
-  if (d != tbDnPrev) scrollLines -= 2;
+  uint32_t now = millis();
+  // falling edge (roll) + debounce; scrollStep is the adjustable rate
+  if (!u && tbUpPrev && now - lastScroll > 90) { scrollLines += scrollStep; lastScroll = now; }
+  if (!d && tbDnPrev && now - lastScroll > 90) { scrollLines -= scrollStep; lastScroll = now; }
   tbUpPrev = u; tbDnPrev = d;
   if (scrollLines < 0) scrollLines = 0;
   if (scrollLines != beforeScroll) draw();
@@ -326,18 +350,29 @@ void loop() {
       if (s.startsWith("ask ") || s.startsWith("claude "))
         sendPrompt(s.substring(s.indexOf(' ') + 1));
       else if (s.startsWith("font ")) {
-        chatFontIdx = fontArgToIdx(s.substring(5), chatFontIdx);
-        Serial.printf("chat font=%s\n", FONTS[chatFontIdx].name); draw();
+        chatFontIdx = fontArgToIdx(s.substring(5), chatFontIdx); saveCfg();
+        Serial.printf("chat font=%s (saved)\n", FONTS[chatFontIdx].name); draw();
       } else if (s.startsWith("inputfont ")) {
-        inputFontIdx = fontArgToIdx(s.substring(10), inputFontIdx);
-        Serial.printf("input font=%s\n", FONTS[inputFontIdx].name); draw();
+        inputFontIdx = fontArgToIdx(s.substring(10), inputFontIdx); saveCfg();
+        Serial.printf("input font=%s (saved)\n", FONTS[inputFontIdx].name); draw();
       } else if (s.startsWith("color ")) {
         int sp = s.indexOf(' ', 6);
         String who = s.substring(6, sp), name = s.substring(sp + 1); name.trim();
         uint16_t col = namedColor(name);
         if (col == 0xFFFF) Serial.println("colors: teal indigo amber red green cyan magenta orange ink dim");
         else { if (who == "user") userColor = col; else if (who == "ai") aiColor = col;
-               Serial.printf("%s color set\n", who.c_str()); draw(); }
+               saveCfg(); Serial.printf("%s color set (saved)\n", who.c_str()); draw(); }
+      } else if (s.startsWith("scroll ")) {
+        scrollStep = s.substring(7).toInt();
+        if (scrollStep < 1) scrollStep = 1; if (scrollStep > 20) scrollStep = 20;
+        saveCfg(); Serial.printf("scroll rate=%d lines/detent (saved)\n", scrollStep);
+      } else if (s.startsWith("splash ")) {
+        splashMs = s.substring(7).toInt();
+        if (splashMs < 0) splashMs = 0; if (splashMs > 15000) splashMs = 15000;
+        saveCfg(); Serial.printf("splash=%d ms (saved)\n", splashMs);
+      } else if (s == "settings" || s == "cfg") {
+        Serial.printf("chatFont=%s inputFont=%s scroll=%d splash=%dms\n",
+                      FONTS[chatFontIdx].name, FONTS[inputFontIdx].name, scrollStep, splashMs);
       } else if (s == "ip")
         Serial.printf("ip=%s status=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status());
     } else serialBuf += c;
