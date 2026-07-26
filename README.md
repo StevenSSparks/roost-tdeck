@@ -102,10 +102,10 @@ pio device monitor -e app     # (optional) watch the serial console
   checks the provider actually answers (and pings a local Ollama) before
   activating — so you never get stranded on a dead provider.
 - **Scroll** the chat: roll the trackball up/down.
-- **On-device commands** (type in the chat, abbreviations OK):
-  `/font small|medium|large` · `/inputfont ...` · `/color user|ai <name>` ·
-  `/scroll <n>` · `/splash <ms>` · `/provider anthropic|openai|gemini|ollama` ·
-  `/model <name>` · `/settings` · `/set`, `/fon`, `/col` …
+- **On-device commands** work in the chat too (type `/`, abbreviations OK) — the
+  same set as the terminal shell below: `/web`, `/map`, `/provider`, `/model`,
+  `/font`, `/color user|ai|accent <name>`, `/snake`, `/help`, … See the full table
+  under **Configure from a terminal**.
 
 ## Configure from a terminal (chat + settings, no rebuild)
 The Communicator is also an **AI chat app you can drive from a terminal** — great
@@ -115,30 +115,39 @@ for advanced setup or pasting long API keys. Two ways in:
 ```sh
 pio device monitor -e app      # or: screen /dev/cu.usbmodem101 115200
 ```
-**Network shell (plain TCP):** turn on *Settings → System → Remote shell*, then
-from any computer **on the same network**:
-```sh
-nc <device-ip> 23              # or: telnet <device-ip>
-```
-**Real SSH (encrypted):** turn on *Settings → System → SSH server* (or `/ssh on`),
-then:
+**Real SSH (encrypted):** turn on *Settings → SSH → SSH server* (or `/ssh on`), then:
 ```sh
 ssh roost@<device-ip>          # default password: roostos
 ```
-Change the login with `/sshuser <name>` and `/sshpass <password>`. The device
-generates its own ED25519 host key on first boot (stored in NVS). You get the
-same chat + `/set` shell, now over SSH.
-Then, in either:
-- **Just type** to chat with the AI (shared with the on-screen chat).
-- `/set` — interactive **setup wizard** (name, timezone, API keys, provider,
-  WiFi, brightness…). `/get` shows current config. `/help` lists commands.
-- `/key anthropic sk-ant-…` · `/provider gemini` · `/wifi <ssid> <pass>` ·
-  `/mapkey <key>` · `/name <you>` · `/map <lat> <lon>` · `/snake` · `/sudoku`
+The device generates its own ED25519 host key on first boot (persisted in NVS).
+Change the login with `/sshuser` / `/sshpass` (or on the SSH settings page).
+
+**Network shell (plain TCP, no auth):** turn on *Settings → SSH → TCP shell*, then:
+```sh
+nc <device-ip> 23              # or: telnet <device-ip>
+```
+
+Whichever you use, the prompt is `roostos>` and you get the **same shell**, shared
+with the on-screen chat. **Just type** to talk to the AI. Commands:
+
+| | |
+|---|---|
+| **Chat** | `/cls` clear screen · `/history [n]` · `/retry` · `/clear` wipe chat · `/who` · `/time` |
+| **Web** | `/web <query>` — DuckDuckGo search, AI reports the answer |
+| **Location** | `/gps` · `/gps stream`\|`stop` · `/map [lat lon\|place]` · `/home <lat lon\|place/zip>` |
+| **AI** | `/provider [name]` (lists/switches) · `/model [name]` · `/tools [name on\|off]` |
+| **Device** | `/status` · `/about` · `/bat` · `/rssi` · `/ip` · `/reboot` |
+| **Setup** | `/set` (lists options) · `/set <opt> <val>` · `/wizard` (guided) · `/get` |
+| **Keys/WiFi** | `/key anthropic\|openai\|gemini <k>` · `/ollama <host>` · `/wifi <ssid> <pw>` · `/mapkey <k>` |
+| **Personalize** | `/name <you>` · `/prompt roostos\|ai\|os\|<word>` · `/status ip\|demo\|phone` · `/brightness 10-100` |
+| **Apps** | `/snake` · `/sudoku` · `/slide` |
+| | `/help` lists everything · `/quit` disconnects |
 
 > Typical flow for a fresh board: flash with only your WiFi set, boot, connect
-> USB-C (or `nc` if reachable), run `/set`, paste your keys — done, no rebuild.
-> **Network shell note:** your Wi-Fi must allow client-to-client traffic (disable
-> "AP/client isolation" on the SSID). USB-C works regardless.
+> USB-C (or `nc`/`ssh` if reachable), run `/set` or `/wizard`, paste your keys —
+> done, no rebuild.
+> **Network note:** SSH/TCP need your Wi-Fi to allow client-to-client traffic
+> (disable "AP/client isolation" on the SSID). USB-C works regardless.
 
 ### Performance & signal notes (ESP32 realities)
 - **Turn SSH/remote-shell off for daily handheld use.** The SSH server runs in its
