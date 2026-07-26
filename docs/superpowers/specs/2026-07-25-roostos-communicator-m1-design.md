@@ -43,7 +43,15 @@ repo before wiring drivers — pins are not guessed.
 - **JSON:** ArduinoJson.
 - **JPEG decode:** TJpg_Decoder (light ESP32 JPEG decoder) for map images ->
   LVGL image buffer.
+- **GPS:** TinyGPS++ over the L76K UART.
+- **Radio status:** RadioLib SX1262 — brought up only to confirm presence and be
+  parked in **sleep** (LoRa unused in M1).
 - **Persistence:** Preferences/NVS.
+
+**Professional/first-class UX bar:** the trackball drives a **real arrow pointer
+cursor** (a proper image asset, not an emoji glyph); screens are consistently
+themed with complete, well-formatted info panels — this device should read as a
+polished product, not a demo.
 
 ## 4. Architecture (modules)
 
@@ -56,17 +64,21 @@ include/
 src/
   main.cpp                boot sequence + LVGL tick loop + Claude tool loop pump
   board/board.cpp         power-enable (GPIO10), display, keyboard(I2C), trackball
-  drivers/gps.cpp         u-blox UART parse -> {lat, lon, fix, sats}
+  drivers/gps.cpp         L76K UART (TinyGPS++) -> lat/lon/speed/course/alt/sats/hdop/utc
   drivers/audio.cpp       I2S tone/beep generator (play_tone)
-  drivers/battery.cpp     ADC -> voltage + charge %
+  drivers/battery.cpp     ADC -> voltage + percent + charging + coarse health (est.)
+  drivers/radio.cpp       SX1262 presence check, held in SLEEP (LoRa off in M1)
   ui/theme.cpp            RoostOS LVGL theme (teal/indigo/amber on #0d1117)
   ui/ui.cpp               screen manager + navigation
+  ui/cursor_arrow.c       LVGL arrow cursor image (real pointer, not emoji)
   ui/screen_boot.cpp      splash -> status
-  ui/screen_menu.cpp      Chat . WiFi . Stats . Settings
+  ui/screen_menu.cpp      Chat . WiFi . GPS . System . Settings
   ui/screen_wifi.cpp      scan list, password entry, saved nets, captive banner, Clone MAC
   ui/screen_chat.cpp      scrolling history, text + image bubbles, input line, Clear
-  ui/screen_settings.cpp  API keys, model, max_tokens, persona, saved MACs, sound on/off
-  ui/screen_stats.cpp     token usage + device/network details
+  ui/screen_gps.cpp       first-class GPS readout + show-on-map
+  ui/screen_system.cpp    tabs: Device / Network / Radio / Usage
+  ui/screen_settings.cpp  API keys, model, max_tokens, persona, saved MACs,
+                          sounds toggle, theme, brightness/KB-backlight/dim sliders
   net/wifi_manager.cpp    scan / connect / NVS saved nets / auto-reconnect
   net/captive_portal.cpp  detection (204 check) + MAC-clone apply + saved MACs
   net/claude_client.cpp   Messages API + agentic tool loop, rolling history
@@ -166,17 +178,26 @@ A persisted **Sounds on/off** toggle in Settings. When off, `play_tone` and all
 UI beeps are muted (the tool still returns a clean `tool_result` so Claude isn't
 confused). Default: on.
 
-## 10b. Stats screen
+## 10b. System screen (Device / Network / Radio / Usage tabs)
 
-A read-only Stats screen (menu entry) showing:
-- **Tokens:** cumulative `input_tokens` / `output_tokens` this session (summed
-  from each Messages API response `usage`), plus last-request tokens and an
-  approximate cost estimate for the selected model.
-- **Network:** WiFi SSID, RSSI, IP, station MAC, captive state.
-- **Device:** GPS fix + sats, battery volts/percent, uptime, free heap, free
-  PSRAM, firmware version.
+A first-class, read-only System screen with tabs:
+- **Device:** model "T-Deck Plus (ESP32-S3)", firmware version, chip MAC, uptime,
+  free heap, free PSRAM, CPU MHz; **Battery** voltage, percent, charging, and a
+  **coarse health estimate** (labeled "est." — no fuel-gauge IC, so true
+  state-of-health is unavailable); current theme + sounds state.
+- **Network:** SSID, RSSI, **IP, gateway, DNS, subnet**, station MAC, captive
+  state, internet-reachable (204 check).
+- **Radio:** SX1262 detected yes/no, **state "SLEEP — LoRa off (M1)"**, reference
+  params (915 MHz / 125 kHz / SF7, labeled "not active"). Confirms the radio is
+  intentionally off and drawing no power.
+- **Usage:** session input/output tokens, last-request tokens, model, estimated
+  cost. Token counters reset with Clear chat and on reboot (session-scoped).
 
-Token counters reset with Clear chat and on reboot (session-scoped).
+## 10d. GPS screen
+
+A dedicated GPS screen showing fix status, **lat, lon, speed, course, altitude,
+satellites, HDOP, and UTC date/time**, with a **Show on map** action that renders
+the current location as an inline Geoapify map. Fields show "—" until a valid fix.
 
 ## 10c. Themes
 

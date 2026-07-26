@@ -58,6 +58,8 @@ lib_deps =
   bblanchon/ArduinoJson@^7
   lvgl/lvgl@^8.4
   bodmer/TJpg_Decoder@^1.1
+  jgromes/RadioLib@^6
+  mikalhart/TinyGPSPlus@^1.0
 extra_scripts = pre:scripts/gen_secrets.py
 
 [env:native]
@@ -572,43 +574,46 @@ Expected: builds clean.
 - [ ] **On-device acceptance:** `pio run -e esp32s3 -t upload` → screen shows the teal title on dark background; serial prints "boardInit ok".
 - [ ] **Step 5: Commit** — `git commit -am "feat(hw): power-enable, ST7789+LVGL, RoostOS theme"`.
 
-### Task 13: Keyboard + trackball as LVGL input
+### Task 13: Keyboard indev + trackball pointer with a real cursor
 
 **Files:**
 - Create: `src/board/input.h/.cpp`
+- Create: `src/ui/cursor_arrow.c` (LVGL C-array arrow image, ~16×16, ARGB — a proper pointer, **not** an emoji glyph)
 - Modify: `src/main.cpp`
 
 **Interfaces:**
-- Produces: `void inputInit();` registering an LVGL keypad indev that reads the I2C keyboard (0x55) and maps trackball GPIO edges to LVGL `LV_KEY_UP/DOWN/LEFT/RIGHT/ENTER`; exposes `lv_indev_t* inputGroupIndev();`.
+- Produces:
+  - `void inputInit();` registering **two** LVGL indevs: a **keypad** indev reading the I2C keyboard (0x55, 1 byte, 0 = none) for text/focus, and a **pointer** indev driven by the trackball (4 direction GPIOs move the cursor by a step; BOOT/GPIO0 click = press) with a custom arrow **cursor image** set via `lv_indev_set_cursor`.
+  - `lv_group_t* inputGroup();` (keyboard-focus group for editable widgets).
 
-- [ ] **Step 1:** Implement `inputInit()`: begin I2C on config pins; LVGL keypad `read_cb` returns the keycode byte (0 = none), mapping trackball direction GPIOs and click to navigation keys.
-- [ ] **Step 2:** Create an `lv_group_t`, attach the indev, and add a temporary text area so typing is visible.
-- [ ] **On-device acceptance:** typing on the QWERTY appears in the text area; trackball moves focus.
-- [ ] **Step 3: Commit** — `git commit -am "feat(hw): keyboard + trackball LVGL input"`.
+- [ ] **Step 1:** Add `cursor_arrow.c` declaring `extern const lv_img_dsc_t cursor_arrow;` (a small opaque arrow, teal/white on transparent).
+- [ ] **Step 2:** Implement `inputInit()`: begin I2C; keypad `read_cb` returns the keycode byte; pointer `read_cb` integrates trackball direction pulses into an (x,y) clamped to the screen and reports `LV_INDEV_STATE_PR` on click; `lv_indev_set_cursor(pointer, &cursor_arrow)`.
+- [ ] **On-device acceptance:** trackball moves a **real arrow pointer** (no emoji) around the screen and clicks widgets; typing on the QWERTY enters text into a focused field.
+- [ ] **Step 3: Commit** — `git commit -am "feat(hw): keyboard indev + trackball pointer with arrow cursor"`.
 
-### Task 14: GPS driver
+### Task 14: GPS driver (full fix data)
 
 **Files:**
 - Create: `src/drivers/gps.h/.cpp`
 
 **Interfaces:**
-- Produces: `struct GpsFix { bool valid; double lat, lon; int sats; };` `void gpsInit();` `void gpsPump();` (call each loop to consume UART), `GpsFix gpsRead();`.
+- Produces: `struct GpsFix { bool valid; double lat, lon; double speedKmh; double courseDeg; double altM; double hdop; int sats; int year, month, day, hour, minute, second; };` `void gpsInit();` `void gpsPump();` (feed UART bytes to TinyGPS++ each loop), `GpsFix gpsRead();`.
 
-- [ ] **Step 1:** Implement NMEA parsing over the GPS UART (config pins/baud) — minimal `$GPGGA`/`$GPRMC` extraction of lat/lon/sats/fix. (A tiny hand parser or TinyGPS++ via lib_deps; if adding a lib, append to `esp32s3` lib_deps only.)
-- [ ] **On-device acceptance:** outdoors or with antenna, serial prints a valid fix within a couple minutes; `gpsRead().valid` becomes true.
-- [ ] **Step 2: Commit** — `git commit -am "feat(hw): u-blox GPS driver"`.
+- [ ] **Step 1:** Implement over **TinyGPS++** on the GPS UART (TX 43 / RX 44 @ 9600 8N1). Populate lat/lon, speed (kmph), course (deg), altitude (m), HDOP, satellite count, and UTC date/time from the parsed sentences; `valid` = `location.isValid()`.
+- [ ] **On-device acceptance:** with antenna/outdoors, `gpsRead()` yields a valid fix with plausible lat/lon/sats and a UTC time within a couple minutes.
+- [ ] **Step 2: Commit** — `git commit -am "feat(hw): L76K GPS driver (full fix)"`.
 
-### Task 15: Battery driver
+### Task 15: Battery driver (voltage + coarse health)
 
 **Files:**
 - Create: `src/drivers/battery.h/.cpp`
 
 **Interfaces:**
-- Produces: `struct Battery { float volts; int percent; bool charging; };` `Battery batteryRead();`.
+- Produces: `struct Battery { float volts; int percent; bool charging; const char* health; };` `Battery batteryRead();` — `health` is a **coarse estimate** from resting voltage (`"Good"` ≥3.9V, `"Fair"` ≥3.7V, `"Low"` ≥3.5V, else `"Critical"`; `"Unknown"` while charging). True state-of-health is not available (no fuel-gauge IC on the T-Deck — bare LiPo on ADC GPIO4); the Device screen labels it "est.".
 
-- [ ] **Step 1:** Implement ADC read on the battery pin with the board's divider ratio → volts; map volts→percent (3.3V=0%, 4.2V=100%, clamped).
-- [ ] **On-device acceptance:** serial prints a plausible voltage (~3.7–4.2V) and percent.
-- [ ] **Step 2: Commit** — `git commit -am "feat(hw): battery driver"`.
+- [ ] **Step 1:** Implement ADC read on `BOARD_BAT_ADC` (GPIO4) with the board's divider ratio → volts; map volts→percent (3.3V=0%, 4.2V=100%, clamped); derive `charging` (rising/high voltage heuristic) and the coarse `health` string.
+- [ ] **On-device acceptance:** serial prints plausible voltage (~3.7–4.2V), percent, and a health label; unplugging/plugging USB flips the charging heuristic.
+- [ ] **Step 2: Commit** — `git commit -am "feat(hw): battery driver (voltage + coarse health)"`.
 
 ### Task 16: Audio tone driver + sound gate
 
@@ -621,6 +626,18 @@ Expected: builds clean.
 - [ ] **Step 1:** Implement I2S sine/square tone generation for `ms` at `freqHz`; guard on the enabled flag.
 - [ ] **On-device acceptance:** `playTone(880,200)` is audible when enabled, silent when disabled.
 - [ ] **Step 2: Commit** — `git commit -am "feat(hw): I2S tone driver + sound gate"`.
+
+### Task 16b: Radio (SX1262) status — held OFF
+
+**Files:**
+- Create: `src/drivers/radio.h/.cpp`
+
+**Interfaces:**
+- Produces: `struct RadioStatus { bool present; const char* state; float freqMHz; float bandwidthKHz; int sf; };` `void radioInit();` (bring up RadioLib SX1262 on `RADIO_CS_PIN`/`RADIO_BUSY_PIN`/`RADIO_RST_PIN`/`RADIO_DIO1_PIN`, then immediately `sleep()`), `RadioStatus radioRead();`. LoRa is **unused in M1** — this exists to display the chip is present and parked OFF/asleep so it draws no power and is not transmitting.
+
+- [ ] **Step 1:** Implement `radioInit()`: construct the SX1262 (shared SPI), `begin()` to confirm presence, then call `sleep()`; record `present` from `begin()` status and `state = "SLEEP (M1: LoRa off)"`. `radioRead()` returns the cached status (config fields shown as the intended US params `915.0 MHz` / `125 kHz` / `SF7` for reference, clearly labeled "not active").
+- [ ] **On-device acceptance:** serial prints `radio present=1 state=SLEEP`; the Radio tab (Task 26) shows the chip detected and OFF.
+- [ ] **Step 2: Commit** — `git commit -am "feat(hw): SX1262 status, held in sleep (LoRa off in M1)"`.
 
 ---
 
@@ -645,7 +662,7 @@ Expected: builds clean.
 - Create: `src/net/wifi_manager.h/.cpp`
 
 **Interfaces:**
-- Produces: `std::vector<WifiScanItem> wifiScan();` (`struct WifiScanItem{String ssid;int rssi;bool locked;}`), `bool wifiConnect(String ssid,String pass,uint32_t timeoutMs);`, `void wifiAutoConnect();` (try saved nets), `bool wifiIsUp();`, `String wifiIp(); String wifiMac(); String wifiSsid(); int wifiRssi();`.
+- Produces: `std::vector<WifiScanItem> wifiScan();` (`struct WifiScanItem{String ssid;int rssi;bool locked;}`), `bool wifiConnect(String ssid,String pass,uint32_t timeoutMs);`, `void wifiAutoConnect();` (try saved nets), `bool wifiIsUp();`, and info getters `String wifiIp(); String wifiGateway(); String wifiDns(); String wifiSubnet(); String wifiMac(); String wifiSsid(); int wifiRssi();`.
 
 - [ ] **Step 1:** Implement using `WiFi` STA: scan, connect with timeout + status, auto-connect looping saved networks (Task 17). On successful manual connect, persist via `saveNetwork`.
 - [ ] **On-device acceptance:** device scans, connects to a known network, serial prints IP; reboot auto-reconnects.
@@ -705,7 +722,7 @@ Expected: builds clean.
 - Modify: `src/main.cpp`
 
 **Interfaces:**
-- Produces: `void uiInit();` (build screens, show boot then menu), `void uiShow(const char* screen);` navigation among `"boot"|"menu"|"chat"|"wifi"|"stats"|"settings"`. Menu lists Chat · WiFi · Stats · Settings and routes trackball/Enter to `uiShow`.
+- Produces: `void uiInit();` (build screens, show boot then menu), `void uiShow(const char* screen);` navigation among `"boot"|"menu"|"chat"|"wifi"|"gps"|"system"|"settings"`. Menu lists **Chat · WiFi · GPS · System · Settings** and routes pointer-click/Enter to `uiShow`.
 
 - [ ] **Step 1:** Implement boot splash → after `boardInit`/`settingsLoad`/`wifiAutoConnect`, transition to menu (a themed list bound to the input group).
 - [ ] **Step 2:** `main.cpp` `setup()` calls `boardInit → applyTheme(cfg.theme) → inputInit → settingsLoad → wifiAutoConnect → uiInit`.
@@ -737,30 +754,50 @@ Expected: builds clean.
 - [ ] **On-device acceptance:** a full conversation works; "show a map of my location" renders an inline map bubble; Clear empties the chat and resets tokens.
 - [ ] **Step 3: Commit** — `git commit -am "feat(ui): chat screen with tools, maps, clear"`.
 
-### Task 25: Settings screen
+### Task 25: Settings screen (fields, toggles, sliders)
 
 **Files:**
 - Create: `src/ui/screen_settings.cpp`
+- Modify: `src/board/board.h/.cpp` (add `void setDisplayBrightness(int level0to16);`)
+- Modify: `src/board/input.h/.cpp` (add `void setKeyboardBacklight(int level0to16);` — the LILYGO keyboard firmware exposes a backlight ("KB-Background"); send its I2C backlight command, verifying the exact byte against the keyboard firmware on-device)
 
 **Interfaces:**
-- Consumes: `settingsLoad/settingsSave` (T17), `applyTheme` (T26), `setSoundsEnabled` (T16).
+- Consumes: `settingsLoad/settingsSave` (T17), `applyTheme` (T27), `setSoundsEnabled` (T16), `setDisplayBrightness`/`setKeyboardBacklight` (this task).
 
-- [ ] **Step 1:** Build editable fields: Anthropic key, Geoapify key, model, max_tokens, persona, tool-loop cap, saved MACs; toggles/selectors: **Sounds on/off** (→ `setSoundsEnabled`), **Theme** (→ `applyTheme` live), **Brightness** (→ backlight PWM), **Sleep timeout**. Save persists via `settingsSave`.
-- [ ] **On-device acceptance:** changing persona/model/max_tokens affects the next chat; toggling sounds mutes tones; changing theme restyles live; changes survive reboot.
-- [ ] **Step 2: Commit** — `git commit -am "feat(ui): settings screen"`.
+- [ ] **Step 1:** Build editable fields: Anthropic key, Geoapify key, model, max_tokens, persona, tool-loop cap, saved MACs. Toggles/selectors: **Sounds on/off** (→ `setSoundsEnabled`), **Theme** (→ `applyTheme` live). **Sliders** (live-applying + persisted): **Display brightness** (→ `setDisplayBrightness`, 0–16), **Screen dim/sleep timeout** (seconds), **Keyboard backlight** (→ `setKeyboardBacklight`, 0–16). Save persists via `settingsSave` (extend `AppConfig`/KV in Task 4 with `kbBacklight` if not already present — add it there and here).
+- [ ] **On-device acceptance:** dragging the brightness slider dims the panel live; the KB-backlight slider changes the keyboard glow; theme switch restyles live; sounds toggle mutes tones; all persist across reboot.
+- [ ] **Step 2: Commit** — `git commit -am "feat(ui): settings screen with brightness/KB/theme/sound controls"`.
 
-### Task 26: Stats screen
+### Task 26: GPS screen
 
 **Files:**
-- Create: `src/ui/screen_stats.cpp`
+- Create: `src/ui/screen_gps.cpp`
 
 **Interfaces:**
-- Consumes: `UsageStats`+`estimateCostUSD` (T9), `wifi*` (T18), `gpsRead` (T14), `batteryRead` (T15), `version.h`.
+- Consumes: `gpsRead` (T14), `geoapifyStaticUrl`+`fetchMapToCanvas` (T21).
+
+- [ ] **Step 1:** Build a first-class, periodically-refreshed GPS panel showing: fix status (Acquiring / Fix), **lat**, **lon**, **speed** (km/h), **course** (°), **altitude** (m), **satellites**, **HDOP**, and **UTC date/time**. Format lat/lon to 5–6 decimals; show "—" when no valid fix.
+- [ ] **Step 2:** Add a **Show on map** button that renders the current fix as a map image below the readout (reuses `fetchMapToCanvas`).
+- [ ] **On-device acceptance:** with a fix, all fields populate live and "Show on map" renders a centered map; with no fix, fields show "—" and status "Acquiring".
+- [ ] **Step 3: Commit** — `git commit -am "feat(ui): first-class GPS screen"`.
+
+### Task 26b: System screen (Device / Network / Radio / Usage tabs)
+
+**Files:**
+- Create: `src/ui/screen_system.cpp`
+- Create: `include/version.h`
+
+**Interfaces:**
+- Consumes: `UsageStats`+`estimateCostUSD` (T9), all `wifi*` getters (T18), `batteryRead` (T15), `radioRead` (T16b), `gpsRead` (T14), `AppConfig` (T3/T17), `ROOST_COMM_VERSION`.
 
 - [ ] **Step 1:** Create `include/version.h` with `#define ROOST_COMM_VERSION "0.1.0-m1"`.
-- [ ] **Step 2:** Build a read-only, periodically-refreshed panel: tokens (session in/out + last + est. cost), network (SSID/RSSI/IP/MAC/captive), device (GPS fix+sats, battery V/%, uptime, free heap, free PSRAM, version).
-- [ ] **On-device acceptance:** after a chat, tokens/cost are non-zero and match usage; device rows show live values.
-- [ ] **Step 3: Commit** — `git commit -am "feat(ui): stats screen"`.
+- [ ] **Step 2:** Build an `lv_tabview` with four tabs, each read-only and refreshed on a timer:
+  - **Device:** model "T-Deck Plus (ESP32-S3)", firmware version, chip MAC, uptime, free heap, free PSRAM, CPU MHz; **Battery:** voltage, percent, charging, **health (est.)**; current theme + sounds state.
+  - **Network:** SSID, RSSI, **IP, gateway, DNS, subnet**, station MAC, captive state, internet-reachable (204 check).
+  - **Radio:** SX1262 detected (yes/no), **state = "SLEEP — LoRa off (M1)"**, reference params (915.0 MHz / 125 kHz / SF7, labeled "not active"). Makes clear the radio is intentionally off and idle.
+  - **Usage:** session input/output tokens, last-request tokens, model, estimated cost (USD).
+- [ ] **On-device acceptance:** Device shows live battery voltage + health and memory; Network shows IP/GW/DNS/subnet; Radio shows the SX1262 present and asleep; Usage matches token counts after a chat.
+- [ ] **Step 3: Commit** — `git commit -am "feat(ui): System screen (device/network/radio/usage)"`.
 
 ### Task 27: Theme table + live switching
 
@@ -801,8 +838,8 @@ Expected: builds clean.
 
 ## Self-Review
 
-**Spec coverage:** §1 goal → all phases; §2 hardware → T11–T16; §3 toolchain → T1; §4 modules → mapped 1:1 across tasks; §5 theme → T12/T27; §6 boot flow → T22; §7 chat+tool loop → T5–T8, T20; §7.1 tools → T6, T21; §8 map → T10, T21; §9 WiFi/captive → T18/T19; §10 chat features/clear → T24; §10a sounds → T16/T25; §10b stats → T9/T26; §10c themes → T27; §11 provisioning → T2/T17; §11a niceties → T25; §12 errors → T20/T21; §13 testing → Phase 1 + T28. No uncovered requirement found.
+**Spec coverage:** §1 goal → all phases; §2 hardware → T11–T16b (pins from LILYGO/HARDWARE.md in T11); §3 toolchain → T1; §4 modules → mapped across tasks; §5 theme → T12/T27; §6 boot flow → T22; §7 chat+tool loop → T5–T8, T20; §7.1 tools → T6, T21; §8 map → T10, T21; §9 WiFi/captive → T18/T19; §10 chat features/clear → T24; §10a sounds → T16/T25; §10b system/stats/tokens → T9/T26b; §10c themes → T27. Added-scope items: real pointer cursor → T13; full GPS data + GPS screen → T14/T26; battery voltage+health → T15/T26b; SX1262 held-off radio screen → T16b/T26b; network IP/GW/DNS/subnet → T18/T26b; brightness/KB-backlight/dim sliders → T25; keychain provisioning → T2/T17. §12 errors → T20/T21; §13 testing → Phase 1 + T28. Professional/first-class UX bar (no emoji UI, consistent theme, complete info screens) is honored by T13/T22/T26/T26b/T27. No uncovered requirement found.
 
-**Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". Hardware tasks intentionally specify on-device acceptance instead of native code because they cannot run under `native`; pin values are sourced from LILYGO in T11 rather than invented.
+**Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". Hardware tasks specify on-device acceptance instead of native code (cannot run under `native`); pins sourced from LILYGO in T11/HARDWARE.md; battery health and radio params are explicitly labeled estimates/"not active" rather than implying capabilities the hardware lacks.
 
-**Type consistency:** `AppConfig`, `ChatHistory`, `ParsedResponse`/`ToolCall`, `UsageStats`, `dispatchTool`, `geoapifyStaticUrl`, `applyTheme`, `setSoundsEnabled`, `setMapTarget` names are used identically across producing and consuming tasks.
+**Type consistency:** `AppConfig`, `ChatHistory`, `ParsedResponse`/`ToolCall`, `UsageStats`, `GpsFix`, `Battery`, `RadioStatus`, `dispatchTool`, `geoapifyStaticUrl`, `applyTheme`, `setSoundsEnabled`, `setDisplayBrightness`, `setKeyboardBacklight`, `setMapTarget`, and the `wifi*` getters are used identically across producing and consuming tasks. Screen ids (`chat/wifi/gps/system/settings`) match T22's `uiShow` set.
