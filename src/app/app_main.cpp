@@ -343,15 +343,27 @@ static void draw() {
   if (start > 0)              tft.drawString("^", scrW - 12, top);
   if (end < (int)wl.size())   tft.drawString("v", scrW - 12, inputY - 12);
 
-  // input line (own font, amber prompt)
+  // input line (own font, amber prompt) + a tappable clear-chat button
+  const int cbw = 34;
   tft.fillRect(0, inputY, scrW, inputH, C_PANEL);
   setFont(inputFontIdx);
   tft.setTextColor(C_AMBER, C_PANEL); tft.drawString("> ", 2, inputY + 2);
   int pw = tft.textWidth("> ") + 2;
   tft.setTextColor(C_INK, C_PANEL);
   String shown = input;
-  while (shown.length() && tft.textWidth(shown) > maxW - pw) shown = shown.substring(1);
+  while (shown.length() && tft.textWidth(shown) > maxW - pw - cbw) shown = shown.substring(1);
   tft.drawString(shown, 2 + pw, inputY + 2);
+  // clear button (bottom-right)
+  tft.drawRoundRect(scrW - cbw, inputY + 1, cbw - 2, inputH - 2, 3, C_DIM);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_DIM, C_PANEL); tft.drawString("clr", scrW - cbw / 2 - 1, inputY + inputH / 2);
+  tft.setTextDatum(TL_DATUM);
+}
+
+static void clearChat() {
+  msgs.clear(); scrollLines = 0; input = "";
+  addMsg("Chat cleared.", C_DIM);
+  draw();
 }
 
 // ---- Settings screen: main page + per-category sub-pages ----
@@ -1090,6 +1102,7 @@ static String applyCfgCmd(String s) {
   if (tok == "snake")  { gameLaunch(0); return "snake"; }
   if (tok == "sudoku") { gameLaunch(1); return "sudoku"; }
   if (cmdIs(tok, "calibrate")) { startCalibration(); return "calibrate: tap the 3 targets on the screen"; }
+  if (cmdIs(tok, "clear")) { clearChat(); return "chat cleared"; }
   if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
   if (cmdIs(tok, "key")) {   // /key anthropic|openai|gemini <api-key>
     int p = rest.indexOf(' ');
@@ -1317,13 +1330,22 @@ static void snakeInit() {
   sdx = ndx = 1; sdy = ndy = 0; gScore = 0; gDead = false;
   placeFood(gFoodX, gFoodY); gTickT = millis();
 }
+// visible [X] quit button in the top-right of the header (for games)
+static void drawQuitX() {
+  tft.fillRect(scrW - 16, 1, 15, headerH - 1, C_BG);
+  tft.drawRect(scrW - 16, 1, 14, headerH - 2, C_DIM);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(C_AMBER, C_BG); tft.drawString("X", scrW - 9, headerH / 2);
+  tft.setTextDatum(TL_DATUM);
+}
 static void snakeDraw() {
   tft.fillScreen(C_BG);
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Snake", 4, 4);
-  tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 60, 4);
-  tft.setTextColor(C_DIM, C_PANEL); tft.drawString(gDead ? "DEAD - any key" : "ball/WASD  q=quit", scrW - 130, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 52, 4);
+  tft.setTextColor(C_DIM, C_PANEL); tft.drawString(gDead ? "DEAD-key" : "ball/WASD", scrW - 88, 4);
+  drawQuitX();
   int oy = headerH;
   tft.fillRect(gFoodX * CELL, oy + gFoodY * CELL, CELL - 1, CELL - 1, C_AMBER);
   for (size_t i = 0; i < snake.size(); i++)
@@ -1345,11 +1367,23 @@ static void snakeTurn(int dx, int dy) {   // ignore 180-degree reversals
   ndx = dx; ndy = dy;
 }
 // --- Sudoku ---
-static const char* SU_PUZZLE =
-  "530070000600195000098000060800060003400803001700020006060000280000419005000080079";
+static const char* SU_PUZZLES[] = {
+  "530070000600195000098000060800060003400803001700020006060000280000419005000080079",
+  "004300209005009001070060043006002087190007400050083000600000105003508690042910300",
+  "000000907000420180000705026100904000050000040000507009920108000034059000507000000",
+  "030050040008010500460000012070502080000603000040109030250000098001020600080060020",
+  "020810740700003100090002805009040087400208003160030200302700060005600008076051090",
+  "100920000524010000000000070050008102000000000402700090060000000000030945000071006",
+  "043080250600000000000001094900004070000608000010200003820500000000000005034090710",
+  "480006902002008001900370060840010200003704100001060049020085007700900600609200018",
+  "000900002050123400030000160908000000070000090000000205091000050007439020400007000",
+  "001900003900700160030005007050000009004302600200000070600100030042007006500006800",
+};
+static const int SU_NPUZZLE = 10;
 static int su[81], suGiven[81], suCur = 0;
 static void sudokuInit() {
-  for (int i = 0; i < 81; i++) { su[i] = SU_PUZZLE[i] - '0'; suGiven[i] = su[i] != 0; }
+  const char* pz = SU_PUZZLES[random(SU_NPUZZLE)];   // pick one of ~10 boards
+  for (int i = 0; i < 81; i++) { su[i] = pz[i] - '0'; suGiven[i] = su[i] != 0; }
   suCur = 0;
 }
 static bool sudokuWon() {
@@ -1364,6 +1398,11 @@ static bool sudokuWon() {
   }
   return true;
 }
+// Sudoku layout (shared by draw + touch): 20px grid + a number-pad row at bottom.
+static const int SU_G = 20, SU_OY = 18;
+static int suOX() { return (scrW - SU_G * 9) / 2; }
+static int suPadY() { return SU_OY + SU_G * 9 + 4; }   // top of number pad
+static int suPadBW() { return scrW / 10; }
 static void sudokuDraw() {
   tft.fillScreen(C_BG);
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
@@ -1371,23 +1410,33 @@ static void sudokuDraw() {
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Sudoku", 4, 4);
   bool won = sudokuWon();
   tft.setTextColor(won ? C_TEAL : C_DIM, C_PANEL);
-  tft.drawString(won ? "SOLVED!  q=quit" : "1-9 set  WASD move  q=quit", scrW - 170, 4);
-  int G = 24, ox = (scrW - G * 9) / 2, oy = headerH + 4;
+  tft.drawString(won ? "SOLVED!" : "tap cell, tap number", 84, 4);
+  drawQuitX();
+  int G = SU_G, ox = suOX(), oy = SU_OY;
   for (int i = 0; i < 81; i++) {
     int r = i / 9, c = i % 9, x = ox + c * G, y = oy + r * G;
     if (i == suCur) tft.fillRect(x, y, G, G, C_PANEL);
     tft.drawRect(x, y, G, G, C_DIM);
-    if (su[i]) { tft.setFreeFont(&FreeSans12pt7b); tft.setTextDatum(MC_DATUM);
+    if (su[i]) { tft.setFreeFont(&FreeSans9pt7b); tft.setTextDatum(MC_DATUM);
       tft.setTextColor(suGiven[i] ? C_INK : C_AMBER, i == suCur ? C_PANEL : C_BG);
       tft.drawString(String(su[i]), x + G / 2, y + G / 2 + 1);
       tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
     }
   }
-  // thick 3x3 separators
-  for (int k = 0; k <= 9; k += 3) {
+  for (int k = 0; k <= 9; k += 3) {                 // thick 3x3 separators
     tft.drawFastVLine(ox + k * G, oy, G * 9, C_TEAL);
     tft.drawFastHLine(ox, oy + k * G, G * 9, C_TEAL);
   }
+  // number pad: 1-9 then C(lear)
+  int ny = suPadY(), bw = suPadBW(), bh = scrH - ny - 1;
+  tft.setTextDatum(MC_DATUM);
+  for (int d = 0; d < 10; d++) {
+    int bx = d * bw;
+    tft.drawRoundRect(bx + 1, ny, bw - 2, bh, 3, C_INDIGO);
+    tft.setTextColor(d < 9 ? C_INK : C_DIM, C_BG);
+    tft.drawString(d < 9 ? String(d + 1) : "C", bx + bw / 2, ny + bh / 2);
+  }
+  tft.setTextDatum(TL_DATUM);
 }
 static void gameLaunch(int which) {
   gGame = which; uiMode = MODE_GAME;
@@ -1487,8 +1536,21 @@ void loop() {
       Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", tRX, tRY, sx, sy, uiMode);
       if (uiMode == MODE_CHAT) {
         if (sy < 40) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // tap top ~40px = menu
-      } else if (uiMode == MODE_MAP || uiMode == MODE_GAME) {
-        uiMode = MODE_CHAT; draw();                 // tap closes map / game
+        else if (sx > scrW - 36 && sy > scrH - 26) clearChat();   // bottom-right = clear chat
+      } else if (uiMode == MODE_MAP) {
+        uiMode = MODE_CHAT; draw();                 // tap anywhere closes the map
+      } else if (uiMode == MODE_GAME) {
+        if (sx > scrW - 18 && sy < headerH + 2) { uiMode = MODE_CHAT; draw(); }   // [X] quit
+        else if (gGame == 1) {                      // Sudoku: tap cell, then tap a number
+          int G = SU_G, ox = suOX(), oy = SU_OY, ny = suPadY(), bw = suPadBW();
+          if (sy >= oy && sy < oy + G * 9 && sx >= ox && sx < ox + G * 9) {
+            suCur = ((sy - oy) / G) * 9 + (sx - ox) / G; sudokuDraw();
+          } else if (sy >= ny) {
+            int d = sx / bw;
+            if (!suGiven[suCur]) su[suCur] = (d < 9) ? d + 1 : 0;   // 1-9 or C=clear
+            sudokuDraw();
+          }
+        }
       } else if (uiMode == MODE_ABOUT) {
         uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
       } else if (uiMode == MODE_SETTINGS) {
