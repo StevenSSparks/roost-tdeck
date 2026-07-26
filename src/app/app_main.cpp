@@ -127,6 +127,8 @@ static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 static String  wifiSsid = "", wifiPass = "";
 // last-known location (from GPS or a manual/AI set); used by the map screen
 static double  locLat = 0, locLon = 0; static bool locValid = false;
+// AI-requested map (set when the model calls the show_map tool; rendered after reply)
+static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
 static TinyGPSPlus gps;
 static HardwareSerial GPSser(1);
 // TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
@@ -649,16 +651,52 @@ static String askAI(const String& prompt) {
 
   if (aiProvider == "anthropic") {
     if (!kAnthropic.length()) return "[no Anthropic key — set via /key anthropic <key>]";
-    JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 400; req["system"] = sp;
-    JsonObject m = req["messages"].to<JsonArray>().add<JsonObject>(); m["role"] = "user"; m["content"] = prompt;
-    String body; serializeJson(req, body);
-    p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
-                     "x-api-key", kAnthropic.c_str(), "anthropic-version", "2023-06-01", err);
-    if (p == "") return "[error] " + err;
-    if (deserializeJson(r, p)) return "[bad JSON]";
-    if (r["type"] == "error") return String("[api] ") + (const char*)(r["error"]["message"] | "");
-    String t; for (JsonObject b : r["content"].as<JsonArray>()) if (b["type"] == "text") t += (const char*)(b["text"] | "");
-    return t.length() ? t : "[no text]";
+    JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 500; req["system"] = sp;
+    JsonArray msgs_ = req["messages"].to<JsonArray>();
+    { JsonObject m = msgs_.add<JsonObject>(); m["role"] = "user"; m["content"] = prompt; }
+    // tools: the model can show a map (using its own knowledge of coordinates) or read GPS
+    JsonArray tools = req["tools"].to<JsonArray>();
+    { JsonObject t = tools.add<JsonObject>();
+      t["name"] = "show_map"; t["description"] = "Display a map on the device screen centered at a latitude/longitude. Use your own knowledge of place coordinates.";
+      JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
+      JsonObject pr = sc["properties"].to<JsonObject>();
+      pr["lat"]["type"] = "number"; pr["lon"]["type"] = "number";
+      JsonArray rq = sc["required"].to<JsonArray>(); rq.add("lat"); rq.add("lon"); }
+    { JsonObject t = tools.add<JsonObject>();
+      t["name"] = "get_location"; t["description"] = "Get the device's current GPS latitude/longitude.";
+      JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object"; sc["properties"].to<JsonObject>(); }
+    for (int round = 0; round < 3; round++) {
+      String body; serializeJson(req, body);
+      p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
+                       "x-api-key", kAnthropic.c_str(), "anthropic-version", "2023-06-01", err);
+      if (p == "") return "[error] " + err;
+      if (deserializeJson(r, p)) return "[bad JSON]";
+      if (r["type"] == "error") return String("[api] ") + (const char*)(r["error"]["message"] | "");
+      String text;
+      JsonObject asst = msgs_.add<JsonObject>(); asst["role"] = "assistant";
+      JsonArray ac = asst["content"].to<JsonArray>();
+      std::vector<String> tuId, tuRes;
+      for (JsonObject b : r["content"].as<JsonArray>()) {
+        String type = (const char*)(b["type"] | "");
+        JsonObject cc = ac.add<JsonObject>();
+        if (type == "text") { cc["type"] = "text"; cc["text"] = (const char*)(b["text"] | ""); text += (const char*)(b["text"] | ""); }
+        else if (type == "tool_use") {
+          cc["type"] = "tool_use"; cc["id"] = (const char*)b["id"]; cc["name"] = (const char*)b["name"]; cc["input"] = b["input"];
+          String name = (const char*)(b["name"] | ""), res;
+          if (name == "show_map") { pMapLat = b["input"]["lat"] | 0.0; pMapLon = b["input"]["lon"] | 0.0; pendingMap = true; res = "map displayed on device"; }
+          else if (name == "get_location") { res = locValid ? String(locLat, 5) + "," + String(locLon, 5) : "no GPS fix"; }
+          else res = "unknown tool";
+          tuId.push_back((const char*)(b["id"] | "")); tuRes.push_back(res);
+        }
+      }
+      if (tuId.empty()) return text.length() ? text : "[no text]";   // done, no tool call
+      JsonObject ur = msgs_.add<JsonObject>(); ur["role"] = "user";
+      JsonArray urc = ur["content"].to<JsonArray>();
+      for (size_t i = 0; i < tuId.size(); i++) {
+        JsonObject tr = urc.add<JsonObject>(); tr["type"] = "tool_result"; tr["tool_use_id"] = tuId[i]; tr["content"] = tuRes[i];
+      }
+    }
+    return "[tool loop limit]";
   }
   if (aiProvider == "openai") {
     if (!kOpenAI.length()) return "[no OpenAI key — set via /key openai <key>]";
@@ -730,6 +768,7 @@ static void sendPrompt(const String& prompt) {
   wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
+  if (pendingMap) { pendingMap = false; showMap(pMapLat, pMapLon, 13); }   // AI asked for a map
 }
 
 static uint8_t readKey() {
@@ -1002,8 +1041,14 @@ static void showMap(double lat, double lon, int zoom) {
   WiFiClientSecure tls; tls.setInsecure();
   HTTPClient http; http.setTimeout(15000);
   if (!http.begin(tls, url)) { mapMsg("map: begin failed"); return; }
+  http.setUserAgent("RoostOS-Communicator");
   int code = http.GET();
-  if (code != 200) { http.end(); mapMsg("map http " + String(code) + " (check key)"); return; }
+  Serial.printf("[map] http=%d keylen=%d\n", code, (int)mapKey.length());   // key intentionally not logged
+  if (code != 200) {
+    String eb = http.getString(); http.end();
+    Serial.printf("[map] err body: %s\n", eb.substring(0, 160).c_str());
+    mapMsg("map http " + String(code) + " (see serial)"); return;
+  }
   int len = http.getSize();
   size_t cap = (len > 0) ? (size_t)len + 16 : 220000;
   uint8_t* buf = (uint8_t*)ps_malloc(cap);
@@ -1107,7 +1152,9 @@ static void handleShellLine(String line) {
   String reply = askAI(line);
   addMsg(aiLabel() + ": " + reply, aiColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
-  shellPrint(aiLabel() + ": " + reply + "\r\n"); shellPrompt();
+  shellPrint(aiLabel() + ": " + reply + "\r\n");
+  if (pendingMap) { pendingMap = false; showMap(pMapLat, pMapLon, 13); shellPrint("(map shown on device)\r\n"); }
+  shellPrompt();
 }
 static void pollShell() {
   if (!shellClient || !shellClient.connected()) {
