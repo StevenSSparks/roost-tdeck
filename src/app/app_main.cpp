@@ -128,6 +128,8 @@ static int     brightness = 230;                   // 0..255 backlight (LEDC PWM
 static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
 static bool    webSearchOn = false;                // allow AI web search (roadmap)
+static bool    toolShowMap = true, toolGetLoc = true;   // AI tools the model may call
+static String  promptWord = "roostos";             // shell prompt word (roostos/ai/os/…)
 static bool    remoteShellOn = false;              // TCP shell on port 23
 // Status-bar mode: IP = SSID+IP; DEMO = masked ("Demo") for photos; PHONE = wifi
 // bars + battery + clock (no SSID/IP). Each renders differently.
@@ -145,6 +147,8 @@ static double  locLat = 0, locLon = 0; static bool locValid = false;
 static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
 // last map shown (persisted) so /map can reopen it without a GPS fix
 static double  lastMapLat = 0, lastMapLon = 0; static bool lastMapValid = false;
+// user-set home location (persisted); a /map fallback when there's no GPS fix
+static double  homeLat = 0, homeLon = 0; static bool homeValid = false;
 // touch calibration: screen = affine(raw). Defaults to identity (uncalibrated).
 static float   tcAx = 1, tcBx = 0, tcCx = 0, tcAy = 0, tcBy = 1, tcCy = 0;
 static bool    touchCalValid = false;
@@ -199,6 +203,9 @@ static void saveCfg() {
   prefs.putBool("sounds", soundsOn);
   prefs.putBool("tball", trackballOn);
   prefs.putBool("websrch", webSearchOn);
+  prefs.putBool("tShowMap", toolShowMap);
+  prefs.putBool("tGetLoc", toolGetLoc);
+  prefs.putString("prompt", promptWord);
   prefs.putBool("rshell", remoteShellOn);
   prefs.putString("mapKey", mapKey);
   prefs.putString("wSsid", wifiSsid);
@@ -214,6 +221,9 @@ static void saveCfg() {
   prefs.putDouble("mapLat", lastMapLat);
   prefs.putDouble("mapLon", lastMapLon);
   prefs.putBool("mapVal", lastMapValid);
+  prefs.putDouble("homeLat", homeLat);
+  prefs.putDouble("homeLon", homeLon);
+  prefs.putBool("homeVal", homeValid);
   prefs.putBool("tcVal2", touchCalValid);
   prefs.putFloat("tcAx", tcAx); prefs.putFloat("tcBx", tcBx); prefs.putFloat("tcCx", tcCx);
   prefs.putFloat("tcAy", tcAy); prefs.putFloat("tcBy", tcBy); prefs.putFloat("tcCy", tcCy);
@@ -237,6 +247,9 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   soundsOn     = prefs.getBool("sounds", soundsOn);
   trackballOn  = prefs.getBool("tball", trackballOn);
   webSearchOn  = prefs.getBool("websrch", webSearchOn);
+  toolShowMap  = prefs.getBool("tShowMap", toolShowMap);
+  toolGetLoc   = prefs.getBool("tGetLoc", toolGetLoc);
+  promptWord   = prefs.getString("prompt", promptWord);
   remoteShellOn = prefs.getBool("rshell", remoteShellOn);
   mapKey       = prefs.getString("mapKey", mapKey);
   wifiSsid     = prefs.getString("wSsid", wifiSsid);
@@ -252,6 +265,9 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   lastMapLat   = prefs.getDouble("mapLat", 0);
   lastMapLon   = prefs.getDouble("mapLon", 0);
   lastMapValid = prefs.getBool("mapVal", false);
+  homeLat      = prefs.getDouble("homeLat", 0);
+  homeLon      = prefs.getDouble("homeLon", 0);
+  homeValid    = prefs.getBool("homeVal", false);
   touchCalValid = prefs.getBool("tcVal2", false);
   if (touchCalValid) {
     tcAx = prefs.getFloat("tcAx", 1); tcBx = prefs.getFloat("tcBx", 0); tcCx = prefs.getFloat("tcCx", 0);
@@ -831,15 +847,15 @@ static String askAI(const String& prompt) {
     JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 500; req["system"] = sp;
     JsonArray msgs_ = req["messages"].to<JsonArray>();
     { JsonObject m = msgs_.add<JsonObject>(); m["role"] = "user"; m["content"] = prompt; }
-    // tools: the model can show a map (using its own knowledge of coordinates) or read GPS
+    // tools the model may call (each individually toggleable via /tools)
     JsonArray tools = req["tools"].to<JsonArray>();
-    { JsonObject t = tools.add<JsonObject>();
+    if (toolShowMap) { JsonObject t = tools.add<JsonObject>();
       t["name"] = "show_map"; t["description"] = "Display a map on the device screen centered at a latitude/longitude. Use your own knowledge of place coordinates.";
       JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
       JsonObject pr = sc["properties"].to<JsonObject>();
       pr["lat"]["type"] = "number"; pr["lon"]["type"] = "number";
       JsonArray rq = sc["required"].to<JsonArray>(); rq.add("lat"); rq.add("lon"); }
-    { JsonObject t = tools.add<JsonObject>();
+    if (toolGetLoc) { JsonObject t = tools.add<JsonObject>();
       t["name"] = "get_location"; t["description"] = "Get the device's current GPS latitude/longitude.";
       JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object"; sc["properties"].to<JsonObject>(); }
     for (int round = 0; round < 3; round++) {
@@ -1200,6 +1216,39 @@ static bool cmdIs(const String& tok, const char* full) {
   String f = full;
   return tok == f || (tok.length() >= 3 && f.startsWith(tok));
 }
+// Geocode a place/zip/address to lat,lon via Geoapify (needs the map key + WiFi).
+static bool geocodePlace(const String& q, double& lat, double& lon) {
+  if (!mapKey.length() || WiFi.status() != WL_CONNECTED) return false;
+  String enc; for (size_t i = 0; i < q.length(); i++) { char c = q[i]; enc += (c == ' ') ? String("%20") : String(c); }
+  String url = "https://api.geoapify.com/v1/geocode/search?limit=1&text=" + enc + "&apiKey=" + mapKey;
+  WiFiClientSecure tls; tls.setInsecure(); HTTPClient h; h.setTimeout(10000);
+  if (!h.begin(tls, url)) return false;
+  int code = h.GET(); if (code != 200) { h.end(); return false; }
+  String body = h.getString(); h.end();
+  JsonDocument d; if (deserializeJson(d, body)) return false;
+  JsonArray f = d["features"].as<JsonArray>();
+  if (f.size() == 0) return false;
+  lon = f[0]["geometry"]["coordinates"][0].as<double>();
+  lat = f[0]["geometry"]["coordinates"][1].as<double>();
+  return true;
+}
+// Web search via the DuckDuckGo Instant Answer API (no key). Returns snippet text.
+static String ddgSearch(const String& q) {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  String enc; for (size_t i = 0; i < q.length(); i++) { char c = q[i]; enc += (c == ' ') ? String("+") : String(c); }
+  String url = "https://api.duckduckgo.com/?q=" + enc + "&format=json&no_html=1&skip_disambig=1";
+  WiFiClientSecure tls; tls.setInsecure(); HTTPClient h; h.setTimeout(12000);
+  if (!h.begin(tls, url)) return "";
+  int code = h.GET(); if (code != 200) { h.end(); return ""; }
+  String body = h.getString(); h.end();
+  JsonDocument d; if (deserializeJson(d, body)) return "";
+  String out = String((const char*)(d["AbstractText"] | ""));
+  int n = 0;
+  for (JsonObject t : d["RelatedTopics"].as<JsonArray>()) {
+    const char* txt = t["Text"] | ""; if (strlen(txt)) { out += "\n- " + String(txt); if (++n >= 5) break; }
+  }
+  return out;
+}
 // Apply a config command (from serial or an on-device "/..." message). Returns a
 // short status string for display; "" if the command was not recognized.
 static String applyCfgCmd(String s) {
@@ -1225,10 +1274,22 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "splash")) { splashMs = constrain(rest.toInt(), 0, 15000); saveCfg(); return String("splash: ") + splashMs + "ms"; }
   if (cmdIs(tok, "provider")) {
     String v = rest; v.toLowerCase();
-    if (v.isEmpty()) return "providers: anthropic openai gemini ollama";
+    if (v.isEmpty()) {
+      String s = "providers (provider <name>):";
+      for (int i = 0; i < NPROV; i++) { String p = PROVIDERS[i];
+        s += String("\r\n  ") + (p == aiProvider ? "* " : "  ") + p + " - " + (providerConfigured(p) ? "ready" : "no key"); }
+      return s;
+    }
     String m; switchProvider(v, m); return m;
   }
-  if (cmdIs(tok, "model")) { if (rest.length()) { aiModel = rest; saveCfg(); } return String("model: ") + aiModel; }
+  if (cmdIs(tok, "model")) {
+    if (rest.length()) { aiModel = rest; saveCfg(); return String("model: ") + aiModel; }
+    String opts = aiProvider == "anthropic" ? "claude-haiku-4-5, claude-sonnet-4-6"
+                : aiProvider == "openai"    ? "gpt-4o-mini, gpt-4o"
+                : aiProvider == "gemini"    ? "gemini-flash-lite-latest, gemini-2.5-flash"
+                                            : "llama3.2, qwen2.5, phi3";
+    return "model: " + aiModel + "\r\n  " + aiProvider + " options: " + opts + "  (or model <any>)";
+  }
   // --- device / personalization ---
   if (cmdIs(tok, "name")) { userName = rest; saveCfg(); return String("name: ") + (userName.length() ? userName : "(cleared)"); }
   if (cmdIs(tok, "tz") || cmdIs(tok, "timezone")) {
@@ -1248,6 +1309,13 @@ static String applyCfgCmd(String s) {
     else return "status: ip | demo | phone";
     saveCfg(); if (uiMode == MODE_CHAT) draw(); return String("status bar: ") + statusName();
   }
+  if (cmdIs(tok, "prompt")) {
+    String v = rest; v.trim();
+    if (v == "empty" || v == "none") promptWord = "";
+    else if (v.length()) promptWord = v;          // roostos | ai | os | custom
+    saveCfg();
+    return String("prompt: ") + (promptWord.length() ? promptWord : "(empty)") + "> ";
+  }
   if (cmdIs(tok, "ssh")) { sshOn = (rest == "on" || rest == "1"); saveCfg();
     return String("ssh: ") + (sshOn ? "on - ssh " + sshUser + "@<ip> (pw set in /sshpass)" : "off"); }
   if (cmdIs(tok, "sshuser")) { if (rest.length()) { sshUser = rest; saveCfg(); } return "ssh user: " + sshUser; }
@@ -1257,13 +1325,31 @@ static String applyCfgCmd(String s) {
     return "gps: no fix yet (sats:" + String(gps.satellites.value()) + ")";
   }
   if (tok == "map") {        // exact-match (so it doesn't collide with 'mapkey')
-    double la, lo;
-    if (rest.length()) { int q = rest.indexOf(' '); if (q <= 0) return "usage: map <lat> <lon>";
-                         la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); }
+    double la, lo; String r = rest; r.trim();
+    if (r == "home") { if (!homeValid) return "no home set - use: home <lat lon> or home <place>"; la = homeLat; lo = homeLon; }
+    else if (r.length()) {
+      int q = r.indexOf(' ');
+      if (q > 0 && (isdigit((unsigned char)r[0]) || r[0] == '-')) { la = r.substring(0, q).toFloat(); lo = r.substring(q + 1).toFloat(); }
+      else if (!geocodePlace(r, la, lo)) return "couldn't find: " + r;   // place / zip / address
+    }
     else if (locValid)     { la = locLat; lo = locLon; }        // 1) live GPS
-    else if (lastMapValid) { la = lastMapLat; lo = lastMapLon; } // 2) last saved map
-    else return "no location yet - try: map <lat> <lon>";
+    else if (homeValid)    { la = homeLat; lo = homeLon; }       // 2) home
+    else if (lastMapValid) { la = lastMapLat; lo = lastMapLon; } // 3) last saved map
+    else return "no location - set home <lat lon> | home <place>, or map <lat lon>";
     showMap(la, lo, 14); return "map";
+  }
+  if (tok == "home") {
+    String r = rest; r.trim();
+    if (r.length()) {
+      double la, lo; int q = r.indexOf(' ');
+      if (q > 0 && (isdigit((unsigned char)r[0]) || r[0] == '-'))
+        { la = r.substring(0, q).toFloat(); lo = r.substring(q + 1).toFloat(); }
+      else if (!geocodePlace(r, la, lo)) return "couldn't find: " + r;
+      homeLat = la; homeLon = lo; homeValid = true; saveCfg();
+      return "home set: " + String(homeLat, 5) + "," + String(homeLon, 5);
+    }
+    return homeValid ? ("home: " + String(homeLat, 5) + "," + String(homeLon, 5))
+                     : "home not set - use: home <lat lon> | home <place/zip>";
   }
   if (tok == "game") { String g = rest; g.toLowerCase();
     if (g.startsWith("sn")) { gameLaunch(0); return "snake"; }
@@ -1404,7 +1490,7 @@ static const int WIZ_N = 10;
 // The shell can drive either the TCP client OR the USB-C serial console.
 static Print* shellOut = nullptr;
 static void shellPrint(const String& s) { if (shellOut) shellOut->print(s); }
-static void shellPrompt() { shellPrint("\r\nroost> "); }
+static void shellPrompt() { shellPrint("\r\n" + promptWord + (promptWord.length() ? "> " : "> ")); }
 static void shellBanner() {
   shellPrint(String("\r\n=== RoostOS Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
   shellPrint("A handheld AI communicator. You're connected over the network.\r\n");
@@ -1420,6 +1506,19 @@ static String shellConfigSummary() {
   s += "map key: " + String(mapKey.length() ? "set" : "none") + "  web search: " + (webSearchOn ? "on" : "off") + "\r\n";
   return s;
 }
+static String lastPrompt;   // for /retry
+static bool    gpsStream = false; static uint32_t gpsStreamT = 0; static Print* streamOut = nullptr;
+static String gpsLine() {
+  String s = "gps: sats=" + String(gps.satellites.value());
+  if (locValid) {
+    s = "gps: " + String(locLat, 6) + "," + String(locLon, 6) +
+        "  sats=" + String(gps.satellites.value()) +
+        "  alt=" + String(gps.altitude.meters(), 0) + "m" +
+        "  spd=" + String(gps.speed.kmph(), 1) + "km/h" +
+        "  hdop=" + String(gps.hdop.hdop(), 1);
+  } else s += "  (no fix)";
+  return s;
+}
 static void handleShellLine(String line) {
   line.trim();
   // in the interactive setup wizard?
@@ -1431,23 +1530,113 @@ static void handleShellLine(String line) {
   }
   if (line.length() == 0) { shellPrompt(); return; }
   if (line == "/quit" || line == "/exit") { shellPrint("73s (bye)\r\n"); if (shellOut == (Print*)&shellClient) shellClient.stop(); return; }
-  if (line == "/help") {
-    shellPrint("Type anything to chat with the AI.\r\n"
-               "/set    interactive setup (name, timezone, provider, wifi...)\r\n"
-               "/get    show current config\r\n"
-               "/name <you> | /provider <p> | /model <m> | /wifi <ssid> <pass>\r\n"
-               "/brightness <10-100> | /tz <hrs> | /sounds on|off | /trackball on|off\r\n"
-               "/mapkey <key> | /ip | /quit\r\n");
+  if (line == "/help" || line == "/?") {
+    shellPrint("Chat: just type. Chat helpers:\r\n"
+               "/cls clear screen | /history [n] | /retry | /clear wipe chat\r\n"
+               "/who | /time | /gps [stream|stop] | /bat | /rssi | /status | /about\r\n"
+               "/web <query> (DuckDuckGo) | /tools [name on|off] | /home <lat lon|place>\r\n"
+               "/get config | /set (list options) | /wizard | /prompt <word> | /ip | /reboot | /quit\r\n"
+               "Config: /name /provider /model /key <prov> <k> /wifi <ssid> <pw> /mapkey\r\n"
+               "        /brightness 10-100 /tz <hrs> /sounds on|off /trackball on|off /status ip|demo|phone\r\n"
+               "Apps: /map [lat lon] | /snake | /sudoku | /slide\r\n");
     shellPrompt(); return;
   }
-  if (line == "/set")  { wizStep = 0; shellPrint("Interactive setup - blank answer skips.\r\n" + String(WIZ_Q[0])); return; }
-  if (line == "/get")  { shellPrint(shellConfigSummary()); shellPrompt(); return; }
-  if (line == "/ip")   { shellPrint("ip=" + WiFi.localIP().toString() + "\r\n"); shellPrompt(); return; }
-  if (line.startsWith("/")) {
+  if (line == "/cls") { shellPrint("\033[2J\033[H"); shellBanner(); shellPrompt(); return; }   // clear terminal screen
+  if (line == "/gps" || line == "/gps status") { shellPrint(gpsLine() + "\r\n"); shellPrompt(); return; }
+  if (line == "/gps stream" || line == "/gps on") {
+    gpsStream = true; streamOut = shellOut; gpsStreamT = 0;
+    shellPrint("GPS streaming every 2s — type /gps stop to end.\r\n"); return;
+  }
+  if (line == "/gps stop" || line == "/gps off") { gpsStream = false; shellPrint("GPS stream stopped.\r\n"); shellPrompt(); return; }
+  if (line == "/bat" || line == "/battery") {
+    shellPrint("battery: " + String(batteryPct()) + "%" + (batteryCharging() ? " (charging)" : "") + "\r\n"); shellPrompt(); return;
+  }
+  if (line == "/rssi" || line == "/signal") {
+    shellPrint("wifi: " + String(WiFi.RSSI()) + "dBm  bars=" + String(wifiLevel()) + "/4\r\n"); shellPrompt(); return;
+  }
+  if (line == "/reboot") { shellPrint("rebooting...\r\n"); delay(200); ESP.restart(); return; }
+  if (line == "/about") {
+    shellPrint("RoostOS Communicator " + String(ROOST_COMM_VERSION) + "\r\n"
+               "Web:    roostos.dev/tdeck\r\nGitHub: github.com/StevenSSparks/roost-tdeck\r\n"
+               "Device: T-Deck Plus (ESP32-S3)   MAC: " + WiFi.macAddress() + "\r\n"
+               "Heap: " + String(ESP.getFreeHeap()/1024) + "K  PSRAM: " + String(ESP.getFreePsram()/1024) + "K  up: " + String(millis()/1000) + "s\r\n");
+    shellPrompt(); return;
+  }
+  if (line == "/status") {
+    shellPrint("provider: " + aiProvider + "/" + aiModel + "   you: " + youLabel + "\r\n"
+               "wifi: " + (WiFi.isConnected() ? WiFi.SSID() : String("down")) + " " + String(WiFi.RSSI()) + "dBm (" + String(wifiLevel()) + "/4)  ip " + WiFi.localIP().toString() + "\r\n"
+               "battery: " + String(batteryPct()) + "%" + (batteryCharging() ? "+" : "") + "   " + gpsLine() + "\r\n"
+               "ssh: " + String(sshOn ? "on" : "off") + "  shell: " + String(remoteShellOn ? "on" : "off") + "  statusbar: " + statusName() + "\r\n");
+    shellPrompt(); return;
+  }
+  if (line.startsWith("/status ")) { String r = applyCfgCmd(line.substring(1)); shellPrint(r + "\r\n"); shellPrompt(); return; }
+  if (line == "/tools" || line.startsWith("/tools ")) {
+    String a = line.length() > 6 ? line.substring(7) : String(""); a.trim();
+    if (!a.length()) { shellPrint(String("AI tools:\r\n  show_map    ") + (toolShowMap ? "on" : "off") +
+                                  "\r\n  get_location " + (toolGetLoc ? "on" : "off") +
+                                  "\r\n(toggle: /tools <name> on|off)\r\n"); shellPrompt(); return; }
+    int sp = a.indexOf(' '); String nm = sp < 0 ? a : a.substring(0, sp); String v = sp < 0 ? "" : a.substring(sp + 1); v.trim();
+    bool on = (v == "on" || v == "1" || v == "");
+    if (nm.startsWith("show") || nm == "map") toolShowMap = on;
+    else if (nm.startsWith("get") || nm == "location" || nm == "loc" || nm == "gps") toolGetLoc = on;
+    else { shellPrint("tools: show_map | get_location\r\n"); shellPrompt(); return; }
+    saveCfg(); shellPrint("tool " + nm + ": " + (on ? "on" : "off") + "\r\n"); shellPrompt(); return;
+  }
+  if (line == "/web" || line.startsWith("/web ")) {
+    String q = line.length() > 4 ? line.substring(5) : String(""); q.trim();
+    if (!q.length()) { shellPrint("usage: /web <query>\r\n"); shellPrompt(); return; }
+    shellPrint("searching DuckDuckGo...\r\n");
+    String res = ddgSearch(q); if (!res.length()) res = "(no instant answer found)";
+    String reply = deMarkdown(askAI("Using these DuckDuckGo search results, answer concisely. Query: \"" + q + "\"\nResults:\n" + res));
+    addMsg(youLabel + " (web): " + q, userColor); addMsg(aiLabel() + ": " + reply, aiColor);
+    if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
+    shellPrint(reply + "\r\n(via DuckDuckGo)\r\n"); shellPrompt(); return;
+  }
+  if (line == "/who") { shellPrint("provider: " + aiProvider + " / " + aiModel + "   you: " + youLabel + "\r\n"); shellPrompt(); return; }
+  if (line == "/time") {
+    time_t t = time(nullptr);
+    if (t > 1700000000) { t += (time_t)tzOffsetMin * 60; struct tm tm; gmtime_r(&t, &tm);
+      char b[32]; strftime(b, sizeof(b), "%Y-%m-%d %H:%M", &tm); shellPrint(String(b) + " (local)\r\n"); }
+    else shellPrint("time not synced (no NTP yet)\r\n");
+    shellPrompt(); return;
+  }
+  if (line == "/history" || line.startsWith("/history ") || line == "/log") {
+    int n = 12; int sp = line.indexOf(' '); if (sp > 0) { int v = line.substring(sp + 1).toInt(); if (v > 0) n = v; }
+    int start = (int)msgs.size() > n ? (int)msgs.size() - n : 0;
+    for (int i = start; i < (int)msgs.size(); i++) shellPrint(msgs[i].text + "\r\n");
+    if (msgs.empty()) shellPrint("(no chat yet)\r\n");
+    shellPrompt(); return;
+  }
+  if (line == "/retry" || line == "/r") {
+    if (!lastPrompt.length()) { shellPrint("nothing to retry\r\n"); shellPrompt(); return; }
+    line = lastPrompt;   // fall through to the chat path below
+  }
+  else if (line == "/set" || line.startsWith("/set ")) {
+    String rest = line.length() > 4 ? line.substring(5) : String(""); rest.trim();
+    if (!rest.length()) {                              // list the settable options
+      shellPrint("Set an option:  /set <option> <value>\r\n"
+                 "  name <you> | you <label> | tz <hours> | brightness <10-100>\r\n"
+                 "  provider anthropic|openai|gemini|ollama | model <name>\r\n"
+                 "  key anthropic|openai|gemini <apikey> | ollama <host:port> | mapkey <key>\r\n"
+                 "  wifi <ssid> <password> | status ip|demo|phone\r\n"
+                 "  sounds on|off | trackball on|off | websearch on|off\r\n"
+                 "  ssh on|off | sshuser <name> | sshpass <password>\r\n"
+                 "  font tiny|small|medium|large | color user|ai|accent <name> | scroll <n> | splash <ms>\r\n"
+                 "Or /wizard for guided step-by-step setup.\r\n");
+      shellPrompt(); return;
+    }
+    String r = applyCfgCmd(rest);                      // apply one option
+    shellPrint((r.length() ? r : String("set: unknown option (type /set to list)")) + "\r\n"); shellPrompt(); return;
+  }
+  else if (line == "/wizard") { wizStep = 0; shellPrint("Guided setup - blank answer skips each.\r\n" + String(WIZ_Q[0])); return; }
+  else if (line == "/get")  { shellPrint(shellConfigSummary()); shellPrompt(); return; }
+  else if (line == "/ip")   { shellPrint("ip=" + WiFi.localIP().toString() + "\r\n"); shellPrompt(); return; }
+  else if (line.startsWith("/")) {
     String r = applyCfgCmd(line.substring(1));
     shellPrint((r.length() ? r : String("unknown command (try /help)")) + "\r\n"); shellPrompt(); return;
   }
   // free text => chat (shared with the on-screen buffer)
+  lastPrompt = line;   // remember for /retry
   addMsg(youLabel + " (ssh): " + line, userColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint("...\r\n");
@@ -1741,6 +1930,7 @@ void loop() {
     String sl; while (sshPopLine(sl)) { shellOut = (Print*)&sshSink; handleShellLine(sl); } }
 
   pollGps();
+  if (gpsStream && streamOut && now - gpsStreamT > 2000) { gpsStreamT = now; streamOut->print(gpsLine()); streamOut->print("\r\n"); }
   if (uiMode == MODE_GAME) gameTick();
 
   // charge-connected detection (no dedicated pin; infer from a voltage rise)
