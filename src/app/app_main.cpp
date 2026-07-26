@@ -122,6 +122,8 @@ static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
 static bool    webSearchOn = false;                // allow AI web search (roadmap)
 static bool    remoteShellOn = false;              // TCP shell on port 23
+static bool    sshOn = false;                      // real SSH server on port 22
+static String  sshUser = "roost", sshPass = "roostos";   // SSH login
 static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 // WiFi override set on-device (empty => fall back to secrets.h DEFAULT_WIFI_*)
 static String  wifiSsid = "", wifiPass = "";
@@ -169,6 +171,9 @@ static void saveCfg() {
   prefs.putString("kOai", kOpenAI);
   prefs.putString("kGem", kGemini);
   prefs.putString("olHost", ollamaHost);
+  prefs.putBool("sshOn", sshOn);
+  prefs.putString("sshUser", sshUser);
+  prefs.putString("sshPass", sshPass);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -195,6 +200,9 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   kOpenAI      = prefs.getString("kOai", kOpenAI);
   kGemini      = prefs.getString("kGem", kGemini);
   ollamaHost   = prefs.getString("olHost", ollamaHost);
+  sshOn        = prefs.getBool("sshOn", sshOn);
+  sshUser      = prefs.getString("sshUser", sshUser);
+  sshPass      = prefs.getString("sshPass", sshPass);
   prefs.end();
 }
 
@@ -395,6 +403,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("About", ">");
       row("WiFi setup", WiFi.isConnected() ? WiFi.SSID() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
+      row("SSH server", sshOn ? "on :22" : "off");
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
@@ -595,10 +604,11 @@ static void activateSetting() {
                 });
             });
           return;
-        case 3: remoteShellOn = !remoteShellOn; break;                  // Remote shell toggle
-        case 4:  // Map key entry
+        case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
+        case 4: sshOn = !sshOn; break;                                  // SSH server toggle
+        case 5:  // Map key entry
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 4; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
           return;
         // IP / Uptime rows are read-only status
       }
@@ -973,6 +983,10 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
   if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
   if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
+  if (cmdIs(tok, "ssh")) { sshOn = (rest == "on" || rest == "1"); saveCfg();
+    return String("ssh: ") + (sshOn ? "on - ssh " + sshUser + "@<ip> (pw set in /sshpass)" : "off"); }
+  if (cmdIs(tok, "sshuser")) { if (rest.length()) { sshUser = rest; saveCfg(); } return "ssh user: " + sshUser; }
+  if (cmdIs(tok, "sshpass")) { if (rest.length()) { sshPass = rest; saveCfg(); } return String("ssh password: set (") + sshPass.length() + " chars)"; }
   if (tok == "gps") {
     if (locValid) return "gps: " + String(locLat, 5) + "," + String(locLon, 5) + "  sats:" + String(gps.satellites.value());
     return "gps: no fix yet (sats:" + String(gps.satellites.value()) + ")";
@@ -1074,6 +1088,19 @@ static void showMap(double lat, double lon, int zoom) {
 //  on-screen chat buffer), or use /help /set /get /quit. Gated by remoteShellOn.
 //  (Plain TCP now; real SSH via libssh_esp32 is the next transport step.)
 // ============================================================================
+// ---- real SSH server (src/app/ssh_server.cpp), driven from this shell ----
+void sshServerStart(); void sshServerStop();
+bool sshPopLine(String& out); void sshQueueOut(const char* s);
+bool sshActive(); bool sshIsRunning();
+extern "C" void sshSetCreds(const char* u, const char* p);
+struct SshPrint : public Print {
+  size_t write(uint8_t b) override { char s[2] = {(char)b, 0}; sshQueueOut(s); return 1; }
+  size_t write(const uint8_t* buf, size_t n) override {
+    String s; s.reserve(n + 1); for (size_t i = 0; i < n; i++) s += (char)buf[i];
+    sshQueueOut(s.c_str()); return n; }
+};
+static SshPrint sshSink;
+
 static WiFiServer shellServer(23);
 static WiFiClient shellClient;
 static bool   shellStarted = false;
@@ -1303,6 +1330,15 @@ void loop() {
   if (remoteShellOn && WiFi.status() == WL_CONNECTED && !shellStarted) { shellServer.begin(); shellServer.setNoDelay(true); shellStarted = true; Serial.println("[shell] listening on :23"); }
   else if ((!remoteShellOn || WiFi.status() != WL_CONNECTED) && shellStarted) { if (shellClient) shellClient.stop(); shellServer.end(); shellStarted = false; }
   if (shellStarted) pollShell();
+
+  // real SSH server lifecycle + input marshaling (runs in its own task)
+  if (sshOn && WiFi.status() == WL_CONNECTED && !sshIsRunning()) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); sshServerStart(); }
+  else if (!sshOn && sshIsRunning()) sshServerStop();
+  { static bool sshWas = false; bool sa = sshActive();
+    if (sa && !sshWas) { shellOut = (Print*)&sshSink; shellBanner(); shellPrompt(); }
+    sshWas = sa;
+    String sl; while (sshPopLine(sl)) { shellOut = (Print*)&sshSink; handleShellLine(sl); } }
+
   pollGps();
   if (uiMode == MODE_GAME) gameTick();
 
