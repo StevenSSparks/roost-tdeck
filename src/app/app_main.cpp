@@ -12,6 +12,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <TinyGPSPlus.h>
 #include <Preferences.h>
 #include <vector>
 #include <functional>
@@ -125,6 +127,14 @@ static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 static String  wifiSsid = "", wifiPass = "";
 // last-known location (from GPS or a manual/AI set); used by the map screen
 static double  locLat = 0, locLon = 0; static bool locValid = false;
+static TinyGPSPlus gps;
+static HardwareSerial GPSser(1);
+// TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
+static bool jpgToTft(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+  if (y >= tft.height()) return 0;
+  tft.pushImage(x, y, w, h, bmp);
+  return 1;
+}
 
 static void applyBrightness() {
   // LEDC PWM on the backlight pin (Arduino-ESP32 2.x API)
@@ -323,6 +333,7 @@ static String defaultModel(const String& p);
 static bool joinWifi(const String& ssid, const String& pass);
 static String activeSsid();
 static void draw();
+static void showMap(double lat, double lon, int zoom);
 
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
@@ -747,6 +758,7 @@ static void connectWifi() {
   String ssid = activeSsid();
   if (ssid.isEmpty()) return;
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);   // disable modem sleep so inbound TCP (the shell) is reliable
   WiFi.begin(ssid.c_str(), activePass().c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(200);
@@ -756,6 +768,7 @@ static void connectWifi() {
 static bool joinWifi(const String& ssid, const String& pass) {
   wifiSsid = ssid; wifiPass = pass; saveCfg();
   WiFi.disconnect(); WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(ssid.c_str(), pass.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
@@ -793,6 +806,8 @@ void setup() {
   Serial.printf("\n=== RoostOS Communicator APP %s ===\n", ROOST_COMM_VERSION);
   Wire.begin(I2C_SDA, I2C_SCL);
   gtProbe();   // detect GT911 touch controller
+  GPSser.begin(9600, SERIAL_8N1, 43, 44);   // L76K GPS on UART1
+  TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(jpgToTft);
 
   tft.init(); tft.setRotation(1);
   scrW = tft.width(); scrH = tft.height();
@@ -900,6 +915,16 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
   if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
   if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
+  if (tok == "gps") {
+    if (locValid) return "gps: " + String(locLat, 5) + "," + String(locLon, 5) + "  sats:" + String(gps.satellites.value());
+    return "gps: no fix yet (sats:" + String(gps.satellites.value()) + ")";
+  }
+  if (tok == "map") {        // exact-match (so it doesn't collide with 'mapkey')
+    double la = locLat, lo = locLon;
+    if (rest.length()) { int q = rest.indexOf(' '); if (q > 0) { la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); } }
+    else if (!locValid) return "no GPS fix yet - try: map <lat> <lon>";
+    showMap(la, lo, 14); return "map";
+  }
   if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
   if (cmdIs(tok, "key")) {   // /key anthropic|openai|gemini <api-key>
     int p = rest.indexOf(' ');
@@ -921,6 +946,56 @@ static String applyCfgCmd(String s) {
     return joinWifi(ssid, pass) ? "joined " + ssid : "join failed: " + ssid;
   }
   return "";
+}
+
+// ============================================================================
+//  GPS (L76K on UART1, pins RX=43 TX=44 @9600) + on-screen maps (Geoapify
+//  static JPEG rendered via TJpg_Decoder).
+// ============================================================================
+static void pollGps() {
+  while (GPSser.available()) gps.encode(GPSser.read());
+  if (gps.location.isValid() && gps.location.age() < 5000) {
+    locLat = gps.location.lat(); locLon = gps.location.lng(); locValid = true;
+  }
+}
+static void mapMsg(const String& m) {
+  tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.setTextColor(C_INK, C_BG); tft.drawString(m, 8, 70);
+  tft.setTextColor(C_DIM, C_BG); tft.drawString("any key = back to chat", 8, scrH - 12);
+}
+static void showMap(double lat, double lon, int zoom) {
+  uiMode = MODE_MAP;
+  if (!mapKey.length())            { mapMsg("No map key. Set one:  /mapkey <key>"); return; }
+  if (WiFi.status() != WL_CONNECTED){ mapMsg("Map needs WiFi."); return; }
+  mapMsg("Loading map...");
+  char clat[16], clon[16]; dtostrf(lat, 0, 6, clat); dtostrf(lon, 0, 6, clon);
+  String url = String("https://maps.geoapify.com/v1/staticmap?style=osm-bright"
+                      "&width=320&height=224&center=lonlat:") + clon + "," + clat +
+               "&zoom=" + zoom + "&format=jpeg&marker=lonlat:" + clon + "," + clat +
+               ";color:%2334e2c0;size:medium&apiKey=" + mapKey;
+  WiFiClientSecure tls; tls.setInsecure();
+  HTTPClient http; http.setTimeout(15000);
+  if (!http.begin(tls, url)) { mapMsg("map: begin failed"); return; }
+  int code = http.GET();
+  if (code != 200) { http.end(); mapMsg("map http " + String(code) + " (check key)"); return; }
+  int len = http.getSize();
+  size_t cap = (len > 0) ? (size_t)len + 16 : 220000;
+  uint8_t* buf = (uint8_t*)ps_malloc(cap);
+  if (!buf) { http.end(); mapMsg("map: out of PSRAM"); return; }
+  WiFiClient* st = http.getStreamPtr(); size_t got = 0; uint32_t t0 = millis();
+  while (http.connected() && (len < 0 || got < (size_t)len) && got < cap && millis() - t0 < 15000) {
+    size_t avail = st->available();
+    if (avail) { int r = st->readBytes(buf + got, min(avail, cap - got)); if (r > 0) { got += r; t0 = millis(); } }
+    else delay(5);
+  }
+  http.end();
+  tft.fillScreen(C_BG);
+  TJpgDec.drawJpg(0, 8, buf, got);
+  free(buf);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.setTextColor(C_AMBER); tft.setTextDatum(TL_DATUM);
+  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : " (set)"), 4, scrH - 11);
 }
 
 // ============================================================================
@@ -954,7 +1029,9 @@ static const char* WIZ_CMD[] = {
 };
 static const int WIZ_N = 10;
 
-static void shellPrint(const String& s) { if (shellClient && shellClient.connected()) shellClient.print(s); }
+// The shell can drive either the TCP client OR the USB-C serial console.
+static Print* shellOut = nullptr;
+static void shellPrint(const String& s) { if (shellOut) shellOut->print(s); }
 static void shellPrompt() { shellPrint("\r\nroost> "); }
 static void shellBanner() {
   shellPrint(String("\r\n=== RoostOS Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
@@ -981,7 +1058,7 @@ static void handleShellLine(String line) {
     wizStep = -1; shellPrint("Setup complete.\r\n"); shellPrompt(); return;
   }
   if (line.length() == 0) { shellPrompt(); return; }
-  if (line == "/quit" || line == "/exit") { shellPrint("73s (bye)\r\n"); shellClient.stop(); return; }
+  if (line == "/quit" || line == "/exit") { shellPrint("73s (bye)\r\n"); if (shellOut == (Print*)&shellClient) shellClient.stop(); return; }
   if (line == "/help") {
     shellPrint("Type anything to chat with the AI.\r\n"
                "/set    interactive setup (name, timezone, provider, wifi...)\r\n"
@@ -1010,9 +1087,10 @@ static void handleShellLine(String line) {
 static void pollShell() {
   if (!shellClient || !shellClient.connected()) {
     WiFiClient c = shellServer.available();
-    if (c) { shellClient = c; shellBuf = ""; wizStep = -1; shellBanner(); shellPrompt(); }
+    if (c) { shellClient = c; shellBuf = ""; wizStep = -1; shellOut = (Print*)&shellClient; shellBanner(); shellPrompt(); }
     return;
   }
+  shellOut = (Print*)&shellClient;
   while (shellClient.available()) {
     char c = shellClient.read();
     if (c == '\r' || c == '\n') {
@@ -1034,6 +1112,7 @@ void loop() {
   if (remoteShellOn && WiFi.status() == WL_CONNECTED && !shellStarted) { shellServer.begin(); shellServer.setNoDelay(true); shellStarted = true; Serial.println("[shell] listening on :23"); }
   else if ((!remoteShellOn || WiFi.status() != WL_CONNECTED) && shellStarted) { if (shellClient) shellClient.stop(); shellServer.end(); shellStarted = false; }
   if (shellStarted) pollShell();
+  pollGps();
 
   // trackball CLICK (GPIO0): chat -> open settings; settings -> activate selection
   bool clk = digitalRead(TB_CLICK);
@@ -1041,6 +1120,7 @@ void loop() {
     clkT = now; Serial.println("[click]");
     if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
+    else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }
     else activateSetting();
   }
   clkPrev = clk;
@@ -1096,6 +1176,7 @@ void loop() {
       } else if (k == 8 || k == 127) { if (textVal.length()) textVal.remove(textVal.length() - 1); drawText(); }
       else if (k >= 32 && k < 127) { textVal += (char)k; drawText(); }
     }
+    else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }        // any key exits map
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
     else if (k == '\r' || k == '\n') {
@@ -1111,19 +1192,26 @@ void loop() {
     else if (k >= 32 && k < 127) { input += (char)k; draw(); }
   }
 
-  // SERIAL commands (ask/ip + settings nav for testing + config via applyCfgCmd)
+  // USB-C SERIAL = the same interactive shell ("SSH over USB"): chat + /set + /get
+  // + all /commands, right in a serial monitor. Test verbs (click/up/down) kept.
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       String s = serialBuf; serialBuf = "";
-      if (s.startsWith("ask ") || s.startsWith("claude "))
-        sendPrompt(s.substring(s.indexOf(' ') + 1));
-      else if (s == "ip")
+      if (s == "ip")
         Serial.printf("ip=%s status=%d mode=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode);
       else if (s == "click") { if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
       else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
       else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
-      else { String r = applyCfgCmd(s); Serial.println(r.length() ? r : "? (try: ask/font/color/scroll/splash/settings/ip)"); }
+      else {
+        shellOut = (Print*)&Serial;
+        if (s.startsWith("ask ")) handleShellLine(s.substring(4));
+        else if (s.startsWith("claude ")) handleShellLine(s.substring(7));
+        else if (s.startsWith("/") || wizStep >= 0) handleShellLine(s);
+        else { String r = applyCfgCmd(s);          // bare config verb?
+               if (r.length()) Serial.println(r);
+               else handleShellLine(s); }           // otherwise: chat
+      }
     } else serialBuf += c;
   }
   delay(8);
