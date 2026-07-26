@@ -1141,6 +1141,7 @@ void setup() {
   pinMode(PIN_POWERON, OUTPUT); digitalWrite(PIN_POWERON, HIGH);
   pinMode(PIN_BL, OUTPUT); digitalWrite(PIN_BL, HIGH);
   pinMode(TB_UP, INPUT_PULLUP); pinMode(TB_DOWN, INPUT_PULLUP); pinMode(TB_CLICK, INPUT_PULLUP);
+  pinMode(1, INPUT_PULLUP); pinMode(2, INPUT_PULLUP);   // trackball LEFT/RIGHT (were floating -> spurious turns)
   Serial.begin(115200); delay(300);
   Serial.printf("\n=== RoostOS Communicator APP %s ===\n", ROOST_COMM_VERSION);
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -1905,7 +1906,7 @@ static void gameKey(uint8_t k) {
   }
 }
 static void gameTick() {   // snake auto-advance; starts gentle, speeds up with score
-  int period = 220 - gScore * 6; if (period < 90) period = 90;
+  int period = 320 - gScore * 8; if (period < 130) period = 130;   // gentle start, ramps up
   if (gGame == 0 && gStarted && !gDead && millis() - gTickT > (uint32_t)period) { gTickT = millis(); snakeStep(); }
 }
 
@@ -1966,12 +1967,14 @@ void loop() {
     } else if (uiMode == MODE_SETTINGS) {
       if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); lastScroll = now; drawSettings(); }
       if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % pageLen(setPage); lastScroll = now; drawSettings(); }
-    } else if (uiMode == MODE_GAME && gGame == 0) {   // snake steering
+    } else if (uiMode == MODE_GAME && gGame == 0) {   // snake steering (edge-triggered)
+      static bool lPrev = true, rPrev = true;
       bool lft = digitalRead(1), rgt = digitalRead(2);   // TB_LEFT=GPIO1, TB_RIGHT=GPIO2
       if (!u && tbUpPrev) snakeTurn(0, -1);
       if (!d && tbDnPrev) snakeTurn(0, 1);
-      if (!lft) snakeTurn(-1, 0);
-      if (!rgt) snakeTurn(1, 0);
+      if (!lft && lPrev) snakeTurn(-1, 0);
+      if (!rgt && rPrev) snakeTurn(1, 0);
+      lPrev = lft; rPrev = rgt;
     }
   }
   tbUpPrev = u; tbDnPrev = d;
