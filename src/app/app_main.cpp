@@ -108,7 +108,8 @@ static void setFont(int idx) {
 // ---- configurable state (future Settings) ----
 static int chatFontIdx  = 1;   // message text size (default small = FreeSans 9pt)
 static int inputFontIdx = 1;   // input-box text size (default small)
-static uint16_t userColor, aiColor;   // set in setup(); configurable
+static uint16_t userColor, aiColor, accentColor;   // set in setup(); configurable
+static String  youLabel = "You";      // chat label for your own messages (name/initials)
 static int splashMs   = 3500;  // boot splash duration
 static int scrollStep = 2;     // lines per trackball detent (adjustable "rate")
 static String aiProvider = DEFAULT_AI_PROVIDER;   // anthropic|openai|gemini|ollama
@@ -122,6 +123,7 @@ static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
 static bool    webSearchOn = false;                // allow AI web search (roadmap)
 static bool    remoteShellOn = false;              // TCP shell on port 23
+static bool    demoMode = false;                   // mask WiFi SSID as "Demo" for photos
 static bool    sshOn = false;                      // real SSH server on port 22
 static String  sshUser = "roost", sshPass = "roostos";   // SSH login
 static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
@@ -151,12 +153,16 @@ static void applyBrightness() {
   if (!init) { ledcSetup(0, 5000, 8); ledcAttachPin(PIN_BL, 0); init = true; }
   ledcWrite(0, constrain(brightness, 8, 255));
 }
+// Network name for display — masked to "Demo" when demo mode is on (for photos).
+static String dispSsid() { return demoMode ? String("Demo") : WiFi.SSID(); }
 
 static void saveCfg() {
   prefs.begin("roostcomm", false);
   prefs.putInt("chatFont", chatFontIdx);
   prefs.putInt("inputFont", inputFontIdx);
   prefs.putUShort("userCol", userColor);
+  prefs.putUShort("accentCol", accentColor);
+  prefs.putString("youLabel", youLabel);
   prefs.putUShort("aiCol", aiColor);
   prefs.putInt("splashMs", splashMs);
   prefs.putInt("scrollStep", scrollStep);
@@ -176,6 +182,7 @@ static void saveCfg() {
   prefs.putString("kOai", kOpenAI);
   prefs.putString("kGem", kGemini);
   prefs.putString("olHost", ollamaHost);
+  prefs.putBool("demo", demoMode);
   prefs.putBool("sshOn", sshOn);
   prefs.putString("sshUser", sshUser);
   prefs.putString("sshPass", sshPass);
@@ -192,6 +199,8 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   chatFontIdx  = prefs.getInt("chatFont", chatFontIdx);
   inputFontIdx = prefs.getInt("inputFont", inputFontIdx);
   userColor    = prefs.getUShort("userCol", userColor);
+  accentColor  = prefs.getUShort("accentCol", accentColor);
+  youLabel     = prefs.getString("youLabel", youLabel);
   aiColor      = prefs.getUShort("aiCol", aiColor);
   splashMs     = prefs.getInt("splashMs", splashMs);
   scrollStep   = prefs.getInt("scrollStep", scrollStep);
@@ -211,6 +220,7 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   kOpenAI      = prefs.getString("kOai", kOpenAI);
   kGemini      = prefs.getString("kGem", kGemini);
   ollamaHost   = prefs.getString("olHost", ollamaHost);
+  demoMode     = prefs.getBool("demo", demoMode);
   sshOn        = prefs.getBool("sshOn", sshOn);
   sshUser      = prefs.getString("sshUser", sshUser);
   sshPass      = prefs.getString("sshPass", sshPass);
@@ -237,6 +247,12 @@ static uint16_t namedColor(const String& n) {
   if (n == "cyan")    return tft.color565(0x4d, 0xe6, 0xff);
   if (n == "magenta" || n == "pink") return tft.color565(0xff, 0x6a, 0xd5);
   if (n == "orange")  return tft.color565(0xff, 0x9a, 0x3d);
+  if (n == "purple")  return tft.color565(0xb0, 0x7d, 0xff);
+  if (n == "sky")     return tft.color565(0x5a, 0xc8, 0xff);
+  if (n == "lime")    return tft.color565(0xc6, 0xff, 0x4d);
+  if (n == "rose")    return tft.color565(0xff, 0x6a, 0x8a);
+  if (n == "gold")    return tft.color565(0xff, 0xd2, 0x4d);
+  if (n == "mint")    return tft.color565(0x6a, 0xff, 0xc2);
   return 0xFFFF;  // 0xFFFF = "unknown"
 }
 
@@ -250,8 +266,9 @@ enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_
 static int setPage = PG_MAIN;
 static int setFirst = 0;     // first visible row (settings scroll window)
 static String setMsg = "";   // transient status line (e.g. provider switch result)
-static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
-static const int NPAL = 9;
+static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange",
+                                  "purple","sky","lime","rose","gold","mint","ink"};
+static const int NPAL = 15;
 static int palIndexOf(uint16_t c) { for (int i = 0; i < NPAL; i++) if (namedColor(PAL_NAMES[i]) == c) return i; return 0; }
 #define TB_CLICK 0   // trackball center button (BOARD_BOOT_PIN / GPIO0)
 
@@ -308,7 +325,7 @@ static void draw() {
   // menu button (hamburger) top-right — tap to open Settings
   for (int b = 0; b < 3; b++) tft.fillRect(scrW - 20, 3 + b * 4, 15, 2, C_AMBER);
   String net = WiFi.status() == WL_CONNECTED
-    ? (WiFi.SSID() + " " + WiFi.localIP().toString()) : String("WiFi down");
+    ? (dispSsid() + " " + WiFi.localIP().toString()) : String("WiFi down");
   tft.setTextColor(C_DIM, C_PANEL);
   tft.drawString(net, scrW - tft.textWidth(net) - 24, 4);
 
@@ -348,7 +365,7 @@ static void draw() {
   const int cbw = 34;
   tft.fillRect(0, inputY, scrW, inputH, C_PANEL);
   setFont(inputFontIdx);
-  tft.setTextColor(C_AMBER, C_PANEL); tft.drawString("> ", 2, inputY + 2);
+  tft.setTextColor(accentColor, C_PANEL); tft.drawString("> ", 2, inputY + 2);
   int pw = tft.textWidth("> ") + 2;
   tft.setTextColor(C_INK, C_PANEL);
   String shown = input;
@@ -382,7 +399,7 @@ static void startCalibration();
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
   labels.clear(); values.clear();
-  auto row = [&](const char* l, const String& v){ labels.push_back(l); values.push_back(v); };
+  auto row = [&](const String& l, const String& v){ labels.push_back(l); values.push_back(v); };
   switch (pg) {
     case PG_MAIN:
       row("Back to chat", "");
@@ -403,11 +420,13 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
     case PG_DEVICE:
       row("< Back", "");
       row("Your name", userName.length() ? userName : String("(set)"));
+      row("Chat label", youLabel);
       row("Timezone", (tzOffsetMin >= 0 ? "+" : "-") + String(abs(tzOffsetMin) / 60) + "h");
       row("Brightness", String((brightness * 100) / 255) + "%");
       row("Sounds", soundsOn ? "on" : "off");
       row("Trackball", trackballOn ? "on" : "off");
       row("Web search", webSearchOn ? "on" : "off");
+      row("Demo mode", demoMode ? "on (SSID hidden)" : "off");
       row("Calibrate touch", touchCalValid ? "done" : "needed");
       return "Device";
     case PG_DISPLAY:
@@ -419,8 +438,9 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       return "Display";
     case PG_COLORS:
       row("< Back", "");
-      row("Your color", PAL_NAMES[palIndexOf(userColor)]);
+      row(youLabel + " color", PAL_NAMES[palIndexOf(userColor)]);
       row("AI color",   PAL_NAMES[palIndexOf(aiColor)]);
+      row("Accent/buttons", PAL_NAMES[palIndexOf(accentColor)]);
       return "Colors";
     case PG_AI: {
       row("< Back", "");
@@ -436,7 +456,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
     case PG_SYSTEM:
       row("< Back", "");
       row("About", ">");
-      row("WiFi setup", WiFi.isConnected() ? WiFi.SSID() : String("down"));
+      row("WiFi setup", WiFi.isConnected() ? dispSsid() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
       row("SSH server", sshOn ? "on :22" : "off");
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
@@ -473,13 +493,19 @@ static void drawSettings() {
   for (int i = first; i < first + rowsVis && i < n; i++) {
     bool sel = (i == selIdx);
     if (sel) tft.fillRect(0, y - 2, scrW, lh, C_PANEL);
-    uint16_t c = sel ? C_AMBER : C_INK;
-    if (setPage == PG_COLORS && i == 1 && !sel) c = userColor;
-    if (setPage == PG_COLORS && i == 2 && !sel) c = aiColor;
-    tft.setTextColor(c, sel ? C_PANEL : C_BG);
+    uint16_t bg = sel ? C_PANEL : C_BG;
+    tft.setTextColor(sel ? C_AMBER : C_INK, bg);
     tft.drawString(labels[i], 6, y);
-    if (values[i].length()) {
-      tft.setTextColor(sel ? C_INK : C_DIM, sel ? C_PANEL : C_BG);
+    // color rows: draw a real swatch (WYSIWYG) + the name, so selection is clear
+    bool colorRow = (setPage == PG_COLORS && i >= 1 && i <= 3);
+    if (colorRow) {
+      uint16_t sc = (i == 1) ? userColor : (i == 2) ? aiColor : accentColor;
+      int sw = 26, sh = lh - 8, sxp = scrW - sw - 8;
+      tft.fillRect(sxp, y, sw, sh, sc); tft.drawRect(sxp, y, sw, sh, C_DIM);
+      tft.setTextColor(sel ? C_INK : C_DIM, bg);
+      tft.drawString(values[i], sxp - tft.textWidth(values[i]) - 6, y);
+    } else if (values[i].length()) {
+      tft.setTextColor(sel ? C_INK : C_DIM, bg);
       tft.drawString(values[i], scrW - tft.textWidth(values[i]) - 8, y);
     }
     y += lh;
@@ -509,7 +535,8 @@ static void drawAbout() {
   row("Device", "T-Deck Plus (S3)");
   row("MAC", WiFi.macAddress());
   row("IP", WiFi.localIP().toString());
-  row("WiFi", WiFi.SSID() + " " + String(WiFi.RSSI()) + "dBm");
+  row("WiFi", dispSsid() + " " + String(WiFi.RSSI()) + "dBm");
+  row("Demo mode", demoMode ? "ON (SSID hidden)" : "off");
   row("Heap", String(ESP.getFreeHeap() / 1024) + "K free");
   row("PSRAM", String(ESP.getFreePsram() / 1024) + "K free");
   row("Uptime", String(millis() / 1000) + "s");
@@ -608,8 +635,9 @@ static void activateSetting() {
       }
       break;
     case PG_COLORS:
-      if (selIdx == 1) userColor = namedColor(PAL_NAMES[(palIndexOf(userColor) + 1) % NPAL]);
-      if (selIdx == 2) aiColor   = namedColor(PAL_NAMES[(palIndexOf(aiColor)   + 1) % NPAL]);
+      if (selIdx == 1) userColor   = namedColor(PAL_NAMES[(palIndexOf(userColor)   + 1) % NPAL]);
+      if (selIdx == 2) aiColor     = namedColor(PAL_NAMES[(palIndexOf(aiColor)     + 1) % NPAL]);
+      if (selIdx == 3) accentColor = namedColor(PAL_NAMES[(palIndexOf(accentColor) + 1) % NPAL]);
       break;
     case PG_AI: {
       int modelRow = 1 + NPROV;   // rows 1..NPROV are providers, then Model
@@ -625,19 +653,24 @@ static void activateSetting() {
     }
     case PG_DEVICE:
       switch (selIdx) {
-        case 1:  // Your name -> text entry
+        case 1:  // Your name -> text entry (used in the AI system prompt)
           openText("Your name", userName, "so the AI can greet you", false, MODE_SETTINGS,
                    [](String v){ userName = v; saveCfg(); });
           return;
-        case 2: { // Timezone: cycle -12h..+14h in 1h steps
+        case 2:  // Chat label -> the "You:" tag (name or initials)
+          openText("Chat label", youLabel, "your name tag in chat (e.g. initials)", false, MODE_SETTINGS,
+                   [](String v){ youLabel = v.length() ? v : String("You"); saveCfg(); });
+          return;
+        case 3: { // Timezone: cycle -12h..+14h in 1h steps
           tzOffsetMin += 60; if (tzOffsetMin > 14 * 60) tzOffsetMin = -12 * 60; break; }
-        case 3: { // Brightness: 20/40/60/80/100%
+        case 4: { // Brightness: 20/40/60/80/100%
           int pct = (brightness * 100) / 255; pct += 20; if (pct > 100) pct = 20;
           brightness = (pct * 255) / 100; applyBrightness(); break; }
-        case 4: soundsOn    = !soundsOn;    break;
-        case 5: trackballOn = !trackballOn; break;
-        case 6: webSearchOn = !webSearchOn; break;
-        case 7: startCalibration(); return;   // Calibrate touch
+        case 5: soundsOn    = !soundsOn;    break;
+        case 6: trackballOn = !trackballOn; break;
+        case 7: webSearchOn = !webSearchOn; break;
+        case 8: demoMode = !demoMode; break;   // mask SSID for photos
+        case 9: startCalibration(); return;    // Calibrate touch
       }
       break;
     case PG_SYSTEM:
@@ -814,7 +847,7 @@ static String aiLabel() {
 static void sendPrompt(const String& prompt) {
   scrollLines = 0;
   String lbl = aiLabel() + ": ";
-  addMsg("You: " + prompt, userColor);
+  addMsg(youLabel + ": " + prompt, userColor);
   addMsg("...", C_DIM); draw();
   String reply = askAI(prompt);
   Serial.println(lbl + reply);
@@ -823,7 +856,7 @@ static void sendPrompt(const String& prompt) {
   // show YOUR message at the top of the new exchange (scroll down for long replies)
   setFont(chatFontIdx);
   std::vector<String> ex;
-  wrapMsg("You: " + prompt, scrW - 4, ex);
+  wrapMsg(youLabel + ": " + prompt, scrW - 4, ex);
   wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
@@ -995,7 +1028,7 @@ void setup() {
   C_TEAL   = tft.color565(0x34, 0xe2, 0xc0);
   C_INDIGO = tft.color565(0x7c, 0x8c, 0xff);
   C_AMBER  = tft.color565(0xff, 0xbe, 0x4d);
-  userColor = C_INDIGO; aiColor = C_TEAL;   // defaults
+  userColor = C_INDIGO; aiColor = C_TEAL; accentColor = C_AMBER;   // defaults
   loadCfg();                                 // override from saved settings (NVS)
   applyBrightness();                         // LEDC PWM backlight at saved level
 
@@ -1066,13 +1099,15 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "inputfont")) { inputFontIdx = fontArgToIdx(rest, inputFontIdx); saveCfg(); draw(); return String("input font: ") + FONTS[inputFontIdx].name; }
   if (cmdIs(tok, "color")) {
     int p = rest.indexOf(' ');
-    if (p < 0) return "usage: /color user|ai <name>";
+    if (p < 0) return "usage: /color user|ai|accent <name>";
     String who = rest.substring(0, p), name = rest.substring(p + 1); name.trim();
     uint16_t col = namedColor(name);
-    if (col == 0xFFFF) return "colors: teal indigo amber red green cyan magenta orange ink dim";
-    if (who.startsWith("u")) userColor = col; else if (who.startsWith("a")) aiColor = col; else return "usage: /color user|ai <name>";
+    if (col == 0xFFFF) return "colors: teal indigo amber red green cyan magenta orange purple sky lime rose gold mint ink";
+    if (who.startsWith("u")) userColor = col; else if (who.startsWith("ai") || who == "a") aiColor = col;
+    else if (who.startsWith("acc")) accentColor = col; else return "usage: /color user|ai|accent <name>";
     saveCfg(); draw(); return who + " color set";
   }
+  if (cmdIs(tok, "you")) { youLabel = rest.length() ? rest : String("You"); saveCfg(); if (uiMode == MODE_CHAT) draw(); return "chat label: " + youLabel; }
   if (cmdIs(tok, "scroll")) { scrollStep = constrain(rest.toInt(), 1, 20); saveCfg(); return String("scroll rate: ") + scrollStep; }
   if (cmdIs(tok, "splash")) { splashMs = constrain(rest.toInt(), 0, 15000); saveCfg(); return String("splash: ") + splashMs + "ms"; }
   if (cmdIs(tok, "provider")) {
@@ -1092,6 +1127,7 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
   if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
   if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
+  if (cmdIs(tok, "demo")) { demoMode = (rest == "on" || rest == "1"); saveCfg(); if (uiMode == MODE_CHAT) draw(); return String("demo mode: ") + (demoMode ? "on (SSID hidden)" : "off"); }
   if (cmdIs(tok, "ssh")) { sshOn = (rest == "on" || rest == "1"); saveCfg();
     return String("ssh: ") + (sshOn ? "on - ssh " + sshUser + "@<ip> (pw set in /sshpass)" : "off"); }
   if (cmdIs(tok, "sshuser")) { if (rest.length()) { sshUser = rest; saveCfg(); } return "ssh user: " + sshUser; }
@@ -1258,7 +1294,7 @@ static String shellConfigSummary() {
   String s = "provider: " + aiProvider + " / " + aiModel + "\r\n";
   s += "name: " + (userName.length() ? userName : String("(unset)")) + "\r\n";
   s += "tz: UTC" + String(tzOffsetMin >= 0 ? "+" : "") + String(tzOffsetMin / 60.0, 1) + "h\r\n";
-  s += "wifi: " + (WiFi.isConnected() ? WiFi.SSID() : String("down")) + "  ip: " + WiFi.localIP().toString() + "\r\n";
+  s += "wifi: " + (WiFi.isConnected() ? dispSsid() : String("down")) + "  ip: " + WiFi.localIP().toString() + "\r\n";
   s += "brightness: " + String((brightness * 100) / 255) + "%  sounds: " + (soundsOn ? "on" : "off") +
        "  trackball: " + (trackballOn ? "on" : "off") + "\r\n";
   s += "map key: " + String(mapKey.length() ? "set" : "none") + "  web search: " + (webSearchOn ? "on" : "off") + "\r\n";
@@ -1292,7 +1328,7 @@ static void handleShellLine(String line) {
     shellPrint((r.length() ? r : String("unknown command (try /help)")) + "\r\n"); shellPrompt(); return;
   }
   // free text => chat (shared with the on-screen buffer)
-  addMsg("You (ssh): " + line, userColor);
+  addMsg(youLabel + " (ssh): " + line, userColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint("...\r\n");
   String reply = askAI(line);
