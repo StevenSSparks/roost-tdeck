@@ -140,6 +140,20 @@ Then, in either:
 > **Network shell note:** your Wi-Fi must allow client-to-client traffic (disable
 > "AP/client isolation" on the SSID). USB-C works regardless.
 
+### Performance & signal notes (ESP32 realities)
+- **Turn SSH/remote-shell off for daily handheld use.** The SSH server runs in its
+  own task (crypto + a listener); switching it off frees CPU/RAM and improves
+  battery and UI responsiveness. Flip it on when you want to connect.
+- **Load couples to WiFi range.** Under heavy load the ESP32's receiver gets less
+  sensitive (self-interference), so a busy loop can *cost you signal bars*. The
+  firmware keeps the UI loop light (throttled touch polling) partly for this reason;
+  if SSH handshakes are flaky, a weak antenna and/or high load is usually why.
+- **Antenna matters most.** The T-Deck Plus uses an external WiFi antenna on a U.FL
+  connector — if RSSI is very low (e.g. −80 dBm right next to the router while a
+  laptop shows −45), check that the WiFi antenna is seated (and not swapped with the
+  LoRa one). SSH's key exchange is packet-heavy and needs a decent link; the plain
+  TCP shell (`nc … 23`) tolerates a weaker one.
+
 ## Build environments
 | Env | What |
 |-----|------|
@@ -154,10 +168,9 @@ TCP · real **SSH** server · runtime key config (no rebuild) · **working touch
 (GT911 fix + calibration) · Snake, Sudoku (touch), Slide 1-11 · on-device WiFi +
 personalization.
 
-**Next:** verify the SSH handshake end-to-end (needs Wi-Fi AP-isolation off) ·
-swipe-to-scroll chat via touch · turn-by-turn **directions** · battery ADC
-calibration · custom boot artwork · WiFi auto-reconnect · web search. See
-`MORNING.md` and `docs/superpowers/plans/` for the working plan.
+**Next:** swipe-to-scroll chat via touch · turn-by-turn **directions** · battery
+ADC calibration · custom boot artwork · WiFi auto-reconnect · web search · SSH
+key-based auth. See `MORNING.md` and `docs/superpowers/plans/` for the working plan.
 
 ## Safety
 No secrets are ever committed. Stock firmware can be backed up before flashing
