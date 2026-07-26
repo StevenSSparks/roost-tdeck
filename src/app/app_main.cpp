@@ -122,6 +122,8 @@ static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
 static bool    webSearchOn = false;                // allow AI web search (roadmap)
 static bool    remoteShellOn = false;              // TCP shell on port 23
+static bool    sshOn = false;                      // real SSH server on port 22
+static String  sshUser = "roost", sshPass = "roostos";   // SSH login
 static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 // WiFi override set on-device (empty => fall back to secrets.h DEFAULT_WIFI_*)
 static String  wifiSsid = "", wifiPass = "";
@@ -129,6 +131,8 @@ static String  wifiSsid = "", wifiPass = "";
 static double  locLat = 0, locLon = 0; static bool locValid = false;
 // AI-requested map (set when the model calls the show_map tool; rendered after reply)
 static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
+// last map shown (persisted) so /map can reopen it without a GPS fix
+static double  lastMapLat = 0, lastMapLon = 0; static bool lastMapValid = false;
 static TinyGPSPlus gps;
 static HardwareSerial GPSser(1);
 // TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
@@ -169,6 +173,12 @@ static void saveCfg() {
   prefs.putString("kOai", kOpenAI);
   prefs.putString("kGem", kGemini);
   prefs.putString("olHost", ollamaHost);
+  prefs.putBool("sshOn", sshOn);
+  prefs.putString("sshUser", sshUser);
+  prefs.putString("sshPass", sshPass);
+  prefs.putDouble("mapLat", lastMapLat);
+  prefs.putDouble("mapLon", lastMapLon);
+  prefs.putBool("mapVal", lastMapValid);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -195,6 +205,12 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   kOpenAI      = prefs.getString("kOai", kOpenAI);
   kGemini      = prefs.getString("kGem", kGemini);
   ollamaHost   = prefs.getString("olHost", ollamaHost);
+  sshOn        = prefs.getBool("sshOn", sshOn);
+  sshUser      = prefs.getString("sshUser", sshUser);
+  sshPass      = prefs.getString("sshPass", sshPass);
+  lastMapLat   = prefs.getDouble("mapLat", 0);
+  lastMapLon   = prefs.getDouble("mapLon", 0);
+  lastMapValid = prefs.getBool("mapVal", false);
   prefs.end();
 }
 
@@ -353,7 +369,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       return "Settings";
     case PG_APPS:
       row("< Back", "");
-      row("Map", locValid ? "gps" : "no fix");
+      row("Map", locValid ? "gps" : (lastMapValid ? "saved" : "no fix"));
       row("Snake", ">");
       row("Sudoku", ">");
       row("GPS status", locValid ? String(locLat, 3) + "," + String(locLon, 3) : String("no fix"));
@@ -395,6 +411,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("About", ">");
       row("WiFi setup", WiFi.isConnected() ? WiFi.SSID() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
+      row("SSH server", sshOn ? "on :22" : "off");
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
@@ -533,8 +550,9 @@ static void activateSetting() {
   switch (setPage) {
     case PG_APPS:
       switch (selIdx) {
-        case 1: if (locValid) { showMap(locLat, locLon, 14); return; }
-                setMsg = "no GPS fix; use /map <lat> <lon>"; break;
+        case 1: if (locValid)     { showMap(locLat, locLon, 14); return; }        // GPS
+                if (lastMapValid) { showMap(lastMapLat, lastMapLon, 14); return; } // last saved
+                setMsg = "no location; use /map <lat> <lon>"; break;
         case 2: gameLaunch(0); return;   // Snake
         case 3: gameLaunch(1); return;   // Sudoku
         case 4: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
@@ -595,10 +613,11 @@ static void activateSetting() {
                 });
             });
           return;
-        case 3: remoteShellOn = !remoteShellOn; break;                  // Remote shell toggle
-        case 4:  // Map key entry
+        case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
+        case 4: sshOn = !sshOn; break;                                  // SSH server toggle
+        case 5:  // Map key entry
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 4; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
           return;
         // IP / Uptime rows are read-only status
       }
@@ -973,14 +992,21 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
   if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
   if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
+  if (cmdIs(tok, "ssh")) { sshOn = (rest == "on" || rest == "1"); saveCfg();
+    return String("ssh: ") + (sshOn ? "on - ssh " + sshUser + "@<ip> (pw set in /sshpass)" : "off"); }
+  if (cmdIs(tok, "sshuser")) { if (rest.length()) { sshUser = rest; saveCfg(); } return "ssh user: " + sshUser; }
+  if (cmdIs(tok, "sshpass")) { if (rest.length()) { sshPass = rest; saveCfg(); } return String("ssh password: set (") + sshPass.length() + " chars)"; }
   if (tok == "gps") {
     if (locValid) return "gps: " + String(locLat, 5) + "," + String(locLon, 5) + "  sats:" + String(gps.satellites.value());
     return "gps: no fix yet (sats:" + String(gps.satellites.value()) + ")";
   }
   if (tok == "map") {        // exact-match (so it doesn't collide with 'mapkey')
-    double la = locLat, lo = locLon;
-    if (rest.length()) { int q = rest.indexOf(' '); if (q > 0) { la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); } }
-    else if (!locValid) return "no GPS fix yet - try: map <lat> <lon>";
+    double la, lo;
+    if (rest.length()) { int q = rest.indexOf(' '); if (q <= 0) return "usage: map <lat> <lon>";
+                         la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); }
+    else if (locValid)     { la = locLat; lo = locLon; }        // 1) live GPS
+    else if (lastMapValid) { la = lastMapLat; lo = lastMapLon; } // 2) last saved map
+    else return "no location yet - try: map <lat> <lon>";
     showMap(la, lo, 14); return "map";
   }
   if (tok == "game") { String g = rest; g.toLowerCase();
@@ -1063,9 +1089,13 @@ static void showMap(double lat, double lon, int zoom) {
   tft.fillScreen(C_BG);
   TJpgDec.drawJpg(0, 8, buf, got);
   free(buf);
-  tft.setTextFont(1); tft.setTextSize(1);
-  tft.setTextColor(C_AMBER); tft.setTextDatum(TL_DATUM);
-  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : " (set)"), 4, scrH - 11);
+  // remember this location so /map can reopen it without a fix
+  lastMapLat = lat; lastMapLon = lon; lastMapValid = true; saveCfg();
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_AMBER, C_BG);
+  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : ""), 4, scrH - 11);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("key/click/tap = close", scrW - 118, scrH - 11);
 }
 
 // ============================================================================
@@ -1074,6 +1104,19 @@ static void showMap(double lat, double lon, int zoom) {
 //  on-screen chat buffer), or use /help /set /get /quit. Gated by remoteShellOn.
 //  (Plain TCP now; real SSH via libssh_esp32 is the next transport step.)
 // ============================================================================
+// ---- real SSH server (src/app/ssh_server.cpp), driven from this shell ----
+void sshServerStart(); void sshServerStop();
+bool sshPopLine(String& out); void sshQueueOut(const char* s);
+bool sshActive(); bool sshIsRunning();
+extern "C" void sshSetCreds(const char* u, const char* p);
+struct SshPrint : public Print {
+  size_t write(uint8_t b) override { char s[2] = {(char)b, 0}; sshQueueOut(s); return 1; }
+  size_t write(const uint8_t* buf, size_t n) override {
+    String s; s.reserve(n + 1); for (size_t i = 0; i < n; i++) s += (char)buf[i];
+    sshQueueOut(s.c_str()); return n; }
+};
+static SshPrint sshSink;
+
 static WiFiServer shellServer(23);
 static WiFiClient shellClient;
 static bool   shellStarted = false;
@@ -1303,6 +1346,15 @@ void loop() {
   if (remoteShellOn && WiFi.status() == WL_CONNECTED && !shellStarted) { shellServer.begin(); shellServer.setNoDelay(true); shellStarted = true; Serial.println("[shell] listening on :23"); }
   else if ((!remoteShellOn || WiFi.status() != WL_CONNECTED) && shellStarted) { if (shellClient) shellClient.stop(); shellServer.end(); shellStarted = false; }
   if (shellStarted) pollShell();
+
+  // real SSH server lifecycle + input marshaling (runs in its own task)
+  if (sshOn && WiFi.status() == WL_CONNECTED && !sshIsRunning()) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); sshServerStart(); }
+  else if (!sshOn && sshIsRunning()) sshServerStop();
+  { static bool sshWas = false; bool sa = sshActive();
+    if (sa && !sshWas) { shellOut = (Print*)&sshSink; shellBanner(); shellPrompt(); }
+    sshWas = sa;
+    String sl; while (sshPopLine(sl)) { shellOut = (Print*)&sshSink; handleShellLine(sl); } }
+
   pollGps();
   if (uiMode == MODE_GAME) gameTick();
 
@@ -1348,9 +1400,11 @@ void loop() {
       lastTouch = now;
       if (uiMode == MODE_CHAT) {
         if (sy < headerH && sx > scrW - 26) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
+      } else if (uiMode == MODE_MAP || uiMode == MODE_GAME) {
+        uiMode = MODE_CHAT; draw();                 // tap closes map / game
       } else if (uiMode == MODE_ABOUT) {
         uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
-      } else {
+      } else if (uiMode == MODE_SETTINGS) {
         setFont(1); int lh = tft.fontHeight() + 6; int row = (sy - (headerH + 4)) / lh;
         if (row >= 0 && row < pageLen(setPage)) { selIdx = row; activateSetting(); }
       }

@@ -112,11 +112,19 @@ for advanced setup or pasting long API keys. Two ways in:
 ```sh
 pio device monitor -e app      # or: screen /dev/cu.usbmodem101 115200
 ```
-**Network shell:** turn on *Settings → System → Remote shell*, then from any
-computer **on the same network**:
+**Network shell (plain TCP):** turn on *Settings → System → Remote shell*, then
+from any computer **on the same network**:
 ```sh
 nc <device-ip> 23              # or: telnet <device-ip>
 ```
+**Real SSH (encrypted):** turn on *Settings → System → SSH server* (or `/ssh on`),
+then:
+```sh
+ssh roost@<device-ip>          # default password: roostos
+```
+Change the login with `/sshuser <name>` and `/sshpass <password>`. The device
+generates its own ED25519 host key on first boot (stored in NVS). You get the
+same chat + `/set` shell, now over SSH.
 Then, in either:
 - **Just type** to chat with the AI (shared with the on-screen chat).
 - `/set` — interactive **setup wizard** (name, timezone, API keys, provider,
@@ -141,10 +149,10 @@ Then, in either:
 `show_map` · GPS + NTP time-awareness · terminal chat/config over USB-C and TCP ·
 runtime key config (no rebuild) · Snake + Sudoku · on-device WiFi + personalization.
 
-**Next:** real **SSH** (libssh_esp32) replacing the plain-TCP shell · **touch**
-(GT911) calibration → tap Settings + swipe scroll · turn-by-turn **directions** ·
-battery ADC calibration · custom boot artwork · WiFi auto-reconnect · web search.
-See `MORNING.md` and `docs/superpowers/plans/` for the working plan.
+**Next:** **touch** (GT911) calibration → tap Settings + swipe scroll ·
+turn-by-turn **directions** · SSH key-based auth · battery ADC calibration ·
+custom boot artwork · WiFi auto-reconnect · web search. See `MORNING.md` and
+`docs/superpowers/plans/` for the working plan.
 
 ## Safety
 No secrets are ever committed. Stock firmware can be backed up before flashing
