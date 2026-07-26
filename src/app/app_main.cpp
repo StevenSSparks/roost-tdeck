@@ -14,6 +14,17 @@
 #include "secrets.h"
 #include "version.h"
 
+// Chat font choices: index 0=tiny GLCD, 1..3 = smooth FreeSans small/med/large.
+// Proportional (variable-width) fonts wrapped by pixel width.
+struct FontChoice { const GFXfont* gfx; const char* name; };  // gfx==nullptr => GLCD
+static const FontChoice FONTS[] = {
+  { nullptr,           "tiny"   },   // 0: GLCD 6x8
+  { &FreeSans9pt7b,    "small"  },   // 1
+  { &FreeSans12pt7b,   "medium" },   // 2
+  { &FreeSans18pt7b,   "large"  },   // 3
+};
+static const int NFONTS = 4;
+
 // ---- T-Deck Plus pins (HARDWARE.md) ----
 #define PIN_POWERON 10
 #define PIN_BL      42
@@ -36,64 +47,97 @@ static uint16_t C_BG, C_PANEL, C_INK, C_DIM, C_TEAL, C_INDIGO, C_AMBER;
 struct Msg { String text; uint16_t color; };
 static std::vector<Msg> msgs;        // raw (unwrapped) messages
 static String input;                 // current input line
-static int scrW, scrH, headerH, inputH;
-static int fontSize = 2;             // chat/input text size (1..4), adjustable
+static int scrW, scrH;
+static const int headerH = 15;
+static int fontIdx = 1;              // index into FONTS[]; default "small" FreeSans
 
 static void addMsg(const String& t, uint16_t color) {
   msgs.push_back({t, color});
   while (msgs.size() > 200) msgs.erase(msgs.begin());
 }
 
-static void draw() {
-  const int cw = 6 * fontSize, ch = 8 * fontSize;
-  const int cols = scrW / cw;
-  tft.fillScreen(C_BG);
+static void setChatFont() {
+  const GFXfont* g = FONTS[fontIdx].gfx;
+  if (g) tft.setFreeFont(g);
+  else { tft.setTextFont(1); tft.setTextSize(1); }
+}
 
-  // header (kept compact at size 1)
-  tft.setTextSize(1);
+// Wrap one message to fit maxW pixels using the CURRENT font (proportional-safe).
+static void wrapMsg(const String& text, int maxW, std::vector<String>& out) {
+  String line;
+  int i = 0, n = text.length();
+  while (i <= n) {
+    if (i == n) { out.push_back(line); break; }
+    int j = i;
+    while (j < n && text[j] != ' ' && text[j] != '\n') j++;
+    String word = text.substring(i, j);
+    String trial = line.length() ? line + " " + word : word;
+    if (tft.textWidth(trial) <= maxW) {
+      line = trial;
+    } else {
+      if (line.length()) { out.push_back(line); line = ""; }
+      if (tft.textWidth(word) > maxW) {            // single word too long: hard-break
+        String part;
+        for (int k = 0; k < (int)word.length(); k++) {
+          String t2 = part + word[k];
+          if (tft.textWidth(t2) > maxW && part.length()) { out.push_back(part); part = String(word[k]); }
+          else part = t2;
+        }
+        line = part;
+      } else line = word;
+    }
+    if (j < n && text[j] == '\n') { out.push_back(line); line = ""; }
+    i = j + 1;
+  }
+}
+
+static void draw() {
+  tft.fillScreen(C_BG);
+  tft.setTextDatum(TL_DATUM);
+
+  // header — compact GLCD
+  tft.setTextFont(1); tft.setTextSize(1);
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
-  tft.setTextColor(C_TEAL, C_PANEL); tft.setCursor(4, 4); tft.print("RoostOS");
-  tft.setTextColor(C_INK, C_PANEL); tft.print(" Communicator");
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
+  int rx = 4 + tft.textWidth("RoostOS");
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" Communicator", rx, 4);
   String net = WiFi.status() == WL_CONNECTED
     ? (WiFi.SSID() + " " + WiFi.localIP().toString()) : String("WiFi down");
   tft.setTextColor(C_DIM, C_PANEL);
-  tft.setCursor(scrW - (int)net.length() * 6 - 4, 4); tft.print(net);
+  tft.drawString(net, scrW - tft.textWidth(net) - 4, 4);
 
-  // wrap raw messages into display lines at the current font width
-  std::vector<Msg> wl;
+  // chat font metrics
+  setChatFont();
+  int lh = tft.fontHeight() + 2;
+  int inputH = tft.fontHeight() + 6;
+  int top = headerH + 3;
+  int inputY = scrH - inputH;
+  int maxW = scrW - 4;
+
+  // wrap every message
+  std::vector<std::pair<String, uint16_t>> wl;
   for (auto& m : msgs) {
-    String cur;
-    for (int i = 0; i < (int)m.text.length(); i++) {
-      char c = m.text[i];
-      if (c == '\n') { wl.push_back({cur, m.color}); cur = ""; continue; }
-      cur += c;
-      if ((int)cur.length() >= cols) { wl.push_back({cur, m.color}); cur = ""; }
-    }
-    wl.push_back({cur, m.color});
+    std::vector<String> ls; wrapMsg(m.text, maxW, ls);
+    for (auto& s : ls) wl.push_back({s, m.color});
   }
-
-  // chat area: last N wrapped lines that fit
-  const int top = headerH + 2;
-  const int inputY = scrH - inputH;
-  const int rows = (inputY - top) / (ch + 2);
+  int rows = (inputY - top) / lh;
   int start = (int)wl.size() > rows ? (int)wl.size() - rows : 0;
-  tft.setTextSize(fontSize);
   int y = top;
   for (int i = start; i < (int)wl.size(); i++) {
-    tft.setTextColor(wl[i].color, C_BG);
-    tft.setCursor(2, y); tft.print(wl[i].text);
-    y += ch + 2;
+    tft.setTextColor(wl[i].second, C_BG);
+    tft.drawString(wl[i].first, 2, y);
+    y += lh;
   }
 
   // input line
   tft.fillRect(0, inputY, scrW, inputH, C_PANEL);
-  tft.setTextSize(fontSize);
-  tft.setTextColor(C_AMBER, C_PANEL); tft.setCursor(2, inputY + 2); tft.print("> ");
+  setChatFont();
+  tft.setTextColor(C_AMBER, C_PANEL); tft.drawString("> ", 2, inputY + 2);
+  int pw = tft.textWidth("> ") + 2;
   tft.setTextColor(C_INK, C_PANEL);
   String shown = input;
-  int maxin = cols - 2;
-  if ((int)shown.length() > maxin) shown = shown.substring(shown.length() - maxin);
-  tft.print(shown);
+  while (shown.length() && tft.textWidth(shown) > maxW - pw) shown = shown.substring(1);
+  tft.drawString(shown, 2 + pw, inputY + 2);
 }
 
 // ---- Claude call (proven inline path) ----
@@ -107,6 +151,11 @@ static String askClaude(const String& prompt) {
   https.addHeader("anthropic-version", "2023-06-01");
   JsonDocument req;
   req["model"] = MODEL; req["max_tokens"] = 400;
+  req["system"] =
+    "You are RoostOS, a friendly assistant on a small handheld device with a tiny "
+    "pixel-font screen. Reply in plain ASCII text only: no markdown, no headings, "
+    "no bullet symbols, no emoji, no special/unicode characters. Keep replies short "
+    "and to the point.";
   JsonArray a = req["messages"].to<JsonArray>();
   JsonObject m = a.add<JsonObject>(); m["role"] = "user"; m["content"] = prompt;
   String body; serializeJson(req, body);
@@ -164,14 +213,15 @@ void setup() {
   C_TEAL   = tft.color565(0x34, 0xe2, 0xc0);
   C_INDIGO = tft.color565(0x7c, 0x8c, 0xff);
   C_AMBER  = tft.color565(0xff, 0xbe, 0x4d);
-  headerH = 8 + 6; inputH = 8 * fontSize + 6;
-  Serial.printf("[tft] %dx%d font=%d\n", scrW, scrH, fontSize);
+  Serial.printf("[tft] %dx%d font=%s\n", scrW, scrH, FONTS[fontIdx].name);
 
-  addMsg("Booting… connecting WiFi", C_DIM); draw();
+  fontIdx = 0;   // boot with tiny font so startup messages fit
+  addMsg("Booting... connecting WiFi", C_DIM); draw();
   connectWifi();
   addMsg(WiFi.status() == WL_CONNECTED
-    ? "Connected " + WiFi.localIP().toString() + " — type + Enter"
-    : "WiFi failed — check SSS-FAMILY", C_DIM);
+    ? "Connected " + WiFi.localIP().toString() + " - type + Enter"
+    : "WiFi failed - check SSS-FAMILY", C_DIM);
+  fontIdx = 2;   // swap to preferred font (medium; will come from Settings/NVS later)
   draw();
   Serial.printf("[wifi] status=%d ip=%s\n", (int)WiFi.status(), WiFi.localIP().toString().c_str());
   Serial.println("serial: 'ask <text>' | 'font <1-4>' | 'ip'");
@@ -192,10 +242,15 @@ void loop() {
       if (serialBuf.startsWith("ask ") || serialBuf.startsWith("claude "))
         sendPrompt(serialBuf.substring(serialBuf.indexOf(' ') + 1));
       else if (serialBuf.startsWith("font ")) {
-        int n = serialBuf.substring(5).toInt();
-        fontSize = n < 1 ? 1 : (n > 4 ? 4 : n);
-        inputH = 8 * fontSize + 6;
-        Serial.printf("font=%d\n", fontSize); draw();
+        String arg = serialBuf.substring(5); arg.trim();
+        int idx = fontIdx;
+        if (arg == "tiny") idx = 0; else if (arg == "small") idx = 1;
+        else if (arg == "medium") idx = 2; else if (arg == "large") idx = 3;
+        else { int pt = arg.toInt(); idx = pt <= 6 ? 0 : (pt <= 10 ? 1 : (pt <= 15 ? 2 : 3)); }
+        fontIdx = idx;
+        Serial.printf("font=%s (idx %d)  [options: tiny/small(9)/medium(12)/large(18)]\n",
+                      FONTS[fontIdx].name, fontIdx);
+        draw();
       } else if (serialBuf == "ip")
         Serial.printf("ip=%s status=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status());
       serialBuf = "";
