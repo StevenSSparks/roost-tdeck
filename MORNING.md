@@ -87,3 +87,40 @@ Now on the device (env:app):
   input (trackball optional) — enables touch buttons + game controls. INT on GPIO16.
 - Fun note: the device's own Haiku suggested "Tetris/Snake" unprompted when asked for
   fun uses — it's writing its own roadmap.
+
+---
+
+## Session 2 (late night) — Settings, persistence, more
+**Added & verified (serial):** on-device **Settings screen** (open with trackball
+**click**; roll=move, click=change, "Back to chat"); **About** screen (version,
+device, MAC, IP, WiFi, heap/PSRAM, uptime, touch); **NVS persistence** (font,
+colors, scroll rate, splash all survive reboot); smooth **FreeSans** fonts w/
+small default; **configurable colors**; **scroll indicators** (▴/▾); on-device
+**/commands** with short aliases (`/fon`,`/set`,`/col`,`/scr`,`/spl`); message
+anchored so **your question shows at the top** of each reply. Community **README**
+(get keys → clone → set `secrets.h` → flash). `gen_secrets.py` no longer clobbers a
+hand-written `secrets.h` (distribution-friendly).
+
+**Open Settings today:** press the **trackball center button**. (Menu ☰ is drawn
+top-right for touch, but touch isn't calibrated yet.)
+
+## TOMORROW — pick up here
+1. **Touch (GT911):** my point-parsing returns garbage coords — fix the register
+   read + calibrate the raw→screen mapping (rotation 1). Then: tap ☰ to open
+   settings, tap rows to change, tap ▴/▾ + swipe to scroll. Make touch the primary
+   input; trackball optional.
+2. **Test the MAP features:** wire Geoapify `show_map` and render a map on-screen
+   (needs the GEOAPIFY key). Add a GPS screen.
+3. **On-screen tool loop:** let Claude call get_location / get_battery / show_map /
+   play_tone from the chat (wire the native core into the app).
+4. **Settings additions:** WiFi + API status/edit, **remote-shell on/off** toggle,
+   trackball on/off, sounds, brightness, KB backlight, name+timezone. WiFi
+   **auto-reconnect** (it failed to associate on one boot tonight).
+5. **Remote shell / SSH:** add the telnet (TCP:23) shell to the app (behind the
+   Settings toggle), then real SSH via `libssh_esp32` — like spiderverse's admin shell.
+6. **Games:** Snake, then Sudoku (trackball/touch).
+7. **Boot art:** swap the drawn chick for the real RoostOS chick PNG (keep as logo).
+8. **Confirm on device:** keyboard shift/alt numbers+symbols; About screen contents;
+   the top-anchor "your message shows" feel; default font size.
+
+Envs: `app` (device) · `smoke` (serial/TCP dev shell) · `native` (`pio test -e native`).

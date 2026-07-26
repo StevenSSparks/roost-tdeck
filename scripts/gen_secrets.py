@@ -30,11 +30,17 @@ for macro, item in ITEMS.items():
 for macro, val in FIXED.items():
     lines.append(f'#define {macro} "{val}"')
 
-if missing:
-    sys.stderr.write(
-        "gen_secrets: keychain items not found: " + ", ".join(missing) +
-        "\n  Add them, or build without DEV_SECRETS to type keys on-device.\n")
-    # Non-fatal: allow non-DEV builds. DEV_SECRETS builds will read empty keys.
-with open(out_path, "w") as f:
-    f.write("\n".join(lines) + "\n")
-print("gen_secrets: wrote", out_path)
+# Distribution-friendly: if the macOS keychain has none of the items (i.e. this is
+# not the owner's Mac) but the user already created include/secrets.h by hand
+# (copied from secrets.example.h and filled in), DO NOT clobber it.
+if len(missing) == len(ITEMS) and os.path.exists(out_path):
+    print("gen_secrets: keychain empty; keeping your existing include/secrets.h")
+else:
+    if missing:
+        sys.stderr.write(
+            "gen_secrets: keychain items not found: " + ", ".join(missing) +
+            "\n  Either add them to the keychain, or copy include/secrets.example.h to\n"
+            "  include/secrets.h and fill in your values by hand.\n")
+    with open(out_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print("gen_secrets: wrote", out_path)

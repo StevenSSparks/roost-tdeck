@@ -18,6 +18,7 @@
 #include "version.h"
 
 static Preferences prefs;
+static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 
 // ---- pins ----
 #define PIN_POWERON 10
@@ -49,6 +50,7 @@ static const FontChoice FONTS[] = {
   { &FreeSans12pt7b, "medium" },  // 2
   { &FreeSans18pt7b, "large"  },  // 3
 };
+static const int NFONTS = 4;
 static void setFont(int idx) {
   const GFXfont* g = FONTS[idx].gfx;
   if (g) tft.setFreeFont(g); else { tft.setTextFont(1); tft.setTextSize(1); }
@@ -96,6 +98,15 @@ static uint16_t namedColor(const String& n) {
   if (n == "orange")  return tft.color565(0xff, 0x9a, 0x3d);
   return 0xFFFF;  // 0xFFFF = "unknown"
 }
+
+// ---- settings screen ----
+enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT };
+static int uiMode = MODE_CHAT;
+static int selIdx = 0;
+static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
+static const int NPAL = 9;
+static int palIndexOf(uint16_t c) { for (int i = 0; i < NPAL; i++) if (namedColor(PAL_NAMES[i]) == c) return i; return 0; }
+#define TB_CLICK 0   // trackball center button (BOARD_BOOT_PIN / GPIO0)
 
 // ---- chat state ----
 struct Msg { String text; uint16_t color; };
@@ -147,10 +158,12 @@ static void draw() {
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   int rx = 4 + tft.textWidth("RoostOS");
   tft.setTextColor(C_INK, C_PANEL); tft.drawString(" Communicator", rx, 4);
+  // menu button (hamburger) top-right — tap to open Settings
+  for (int b = 0; b < 3; b++) tft.fillRect(scrW - 20, 3 + b * 4, 15, 2, C_AMBER);
   String net = WiFi.status() == WL_CONNECTED
     ? (WiFi.SSID() + " " + WiFi.localIP().toString()) : String("WiFi down");
   tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString(net, scrW - tft.textWidth(net) - 4, 4);
+  tft.drawString(net, scrW - tft.textWidth(net) - 24, 4);
 
   // input-box metrics (its own font)
   setFont(inputFontIdx);
@@ -179,12 +192,10 @@ static void draw() {
     tft.setTextColor(wl[i].second, C_BG);
     tft.drawString(wl[i].first, 2, y); y += lh;
   }
-  // scrollback indicator
-  if (scrollLines > 0) {
-    tft.setTextFont(1); tft.setTextSize(1);
-    tft.setTextColor(C_AMBER, C_BG);
-    tft.drawString("^ more", scrW - 44, top);
-  }
+  // scroll indicators: ^ = more above, v = more below
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_AMBER, C_BG);
+  if (start > 0)              tft.drawString("^", scrW - 12, top);
+  if (end < (int)wl.size())   tft.drawString("v", scrW - 12, inputY - 12);
 
   // input line (own font, amber prompt)
   tft.fillRect(0, inputY, scrW, inputH, C_PANEL);
@@ -195,6 +206,88 @@ static void draw() {
   String shown = input;
   while (shown.length() && tft.textWidth(shown) > maxW - pw) shown = shown.substring(1);
   tft.drawString(shown, 2 + pw, inputY + 2);
+}
+
+// ---- Settings screen (trackball-navigated) ----
+static const char* SET_ITEMS[] = {
+  "Back to chat", "Chat font", "Input font", "You color", "Haiku color", "Scroll rate", "Splash", "About"
+};
+static const int N_SET = 8;
+
+static String setValue(int i) {
+  switch (i) {
+    case 1: return FONTS[chatFontIdx].name;
+    case 2: return FONTS[inputFontIdx].name;
+    case 3: return PAL_NAMES[palIndexOf(userColor)];
+    case 4: return PAL_NAMES[palIndexOf(aiColor)];
+    case 5: return String(scrollStep);
+    case 6: return String(splashMs / 1000.0, 1) + "s";
+    default: return "";
+  }
+}
+
+static void drawSettings() {
+  tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" Settings", 4 + tft.textWidth("RoostOS"), 4);
+  setFont(1);   // small
+  int lh = tft.fontHeight() + 6, y = headerH + 6;
+  for (int i = 0; i < N_SET; i++) {
+    if (i == selIdx) { tft.fillRect(0, y - 2, scrW, lh, C_PANEL); }
+    uint16_t c = (i == selIdx) ? C_AMBER : C_INK;
+    if (i == 3) c = (i == selIdx) ? C_AMBER : userColor;
+    if (i == 4) c = (i == selIdx) ? C_AMBER : aiColor;
+    tft.setTextColor(c, (i == selIdx) ? C_PANEL : C_BG);
+    tft.drawString(SET_ITEMS[i], 6, y);
+    String v = setValue(i);
+    if (v.length()) { tft.setTextColor((i == selIdx) ? C_INK : C_DIM, (i == selIdx) ? C_PANEL : C_BG);
+                      tft.drawString(v, scrW - tft.textWidth(v) - 8, y); }
+    y += lh;
+  }
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("ball: roll=move  click=change  (or type /set)", 4, scrH - 12);
+}
+
+static void drawAbout() {
+  tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" About", 4 + tft.textWidth("RoostOS"), 4);
+  setFont(1);
+  int y = headerH + 6, lh = tft.fontHeight() + 4;
+  auto row = [&](const String& a, const String& b) {
+    tft.setTextColor(C_DIM, C_BG); tft.drawString(a, 6, y);
+    tft.setTextColor(C_INK, C_BG); tft.drawString(b, 96, y); y += lh;
+  };
+  row("Version", ROOST_COMM_VERSION);
+  row("Device", "T-Deck Plus (S3)");
+  row("MAC", WiFi.macAddress());
+  row("IP", WiFi.localIP().toString());
+  row("WiFi", WiFi.SSID() + " " + String(WiFi.RSSI()) + "dBm");
+  row("Heap", String(ESP.getFreeHeap() / 1024) + "K free");
+  row("PSRAM", String(ESP.getFreePsram() / 1024) + "K free");
+  row("Uptime", String(millis() / 1000) + "s");
+  row("Touch", gtAddr ? "GT911 0x" + String(gtAddr, HEX) : "none");
+  tft.setTextColor(C_AMBER, C_BG); tft.drawString("tap / any key = back", 4, scrH - 12);
+}
+
+static void activateSetting() {
+  if (selIdx == 7) { uiMode = MODE_ABOUT; drawAbout(); return; }   // About
+  switch (selIdx) {
+    case 0: uiMode = MODE_CHAT; draw(); return;
+    case 1: chatFontIdx = (chatFontIdx + 1) % NFONTS; break;
+    case 2: inputFontIdx = (inputFontIdx + 1) % NFONTS; break;
+    case 3: userColor = namedColor(PAL_NAMES[(palIndexOf(userColor) + 1) % NPAL]); break;
+    case 4: aiColor   = namedColor(PAL_NAMES[(palIndexOf(aiColor) + 1) % NPAL]); break;
+    case 5: scrollStep = scrollStep >= 8 ? 1 : scrollStep + 1; break;
+    case 6: { int opts[] = {0, 1500, 3000, 5000}; int cur = 0;
+              for (int k = 0; k < 4; k++) if (opts[k] == splashMs) cur = k;
+              splashMs = opts[(cur + 1) % 4]; break; }
+  }
+  saveCfg(); drawSettings();
 }
 
 static String askClaude(const String& prompt) {
@@ -236,7 +329,12 @@ static void sendPrompt(const String& prompt) {
   Serial.print("Haiku: "); Serial.println(reply);
   if (!msgs.empty()) msgs.pop_back();       // remove "..."
   addMsg("Haiku: " + reply, aiColor);
-  scrollLines = 0;   // show the newest content (end of reply); roll trackball up for history
+  // show YOUR message at the top of the new exchange (scroll down for long replies)
+  setFont(chatFontIdx);
+  std::vector<String> ex;
+  wrapMsg("You: " + prompt, scrW - 4, ex);
+  wrapMsg("Haiku: " + reply, scrW - 4, ex);
+  scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
 }
 
@@ -245,6 +343,37 @@ static uint8_t readKey() {
   if (Wire.available()) return Wire.read();
   return 0;
 }
+
+// ---- GT911 capacitive touch ----
+static void gtProbe() {
+  for (uint8_t a : {0x5D, 0x14}) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) { gtAddr = a; break; }
+  }
+  Serial.printf("[touch] GT911 addr=0x%02X\n", gtAddr);
+}
+// Read one touch point. Returns raw controller coords in rx/ry; false if no touch.
+static bool gtReadRaw(int& rx, int& ry) {
+  if (!gtAddr) return false;
+  Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x4E);
+  if (Wire.endTransmission() != 0) return false;
+  Wire.requestFrom(gtAddr, (uint8_t)1);
+  if (!Wire.available()) return false;
+  uint8_t st = Wire.read();
+  bool touched = (st & 0x80) && (st & 0x0F);
+  if (touched) {
+    Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x50);
+    Wire.endTransmission();
+    Wire.requestFrom(gtAddr, (uint8_t)8);
+    uint8_t b[8]; int i = 0; while (Wire.available() && i < 8) b[i++] = Wire.read();
+    if (i >= 5) { rx = b[1] | (b[2] << 8); ry = b[3] | (b[4] << 8); }
+  }
+  Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x4E); Wire.write(0);
+  Wire.endTransmission();
+  return touched;
+}
+// Map raw touch -> screen coords for TFT rotation 1. FIRST GUESS — calibrated from serial logs.
+static void gtMap(int rx, int ry, int& sx, int& sy) { sx = rx; sy = ry; }
 
 static void connectWifi() {
   if (String(DEFAULT_WIFI_SSID).isEmpty()) return;
@@ -280,10 +409,11 @@ static void drawSplash() {
 void setup() {
   pinMode(PIN_POWERON, OUTPUT); digitalWrite(PIN_POWERON, HIGH);
   pinMode(PIN_BL, OUTPUT); digitalWrite(PIN_BL, HIGH);
-  pinMode(TB_UP, INPUT_PULLUP); pinMode(TB_DOWN, INPUT_PULLUP);
+  pinMode(TB_UP, INPUT_PULLUP); pinMode(TB_DOWN, INPUT_PULLUP); pinMode(TB_CLICK, INPUT_PULLUP);
   Serial.begin(115200); delay(300);
   Serial.printf("\n=== RoostOS Communicator APP %s ===\n", ROOST_COMM_VERSION);
   Wire.begin(I2C_SDA, I2C_SCL);
+  gtProbe();   // detect GT911 touch controller
 
   tft.init(); tft.setRotation(1);
   scrW = tft.width(); scrH = tft.height();
@@ -304,8 +434,8 @@ void setup() {
   addMsg("Booting... connecting WiFi", C_DIM); draw();
   connectWifi();
   addMsg(WiFi.status() == WL_CONNECTED
-    ? "Connected " + WiFi.localIP().toString() + " - type + Enter"
-    : "WiFi failed - check SSS-FAMILY", C_DIM);
+    ? String("Ready to Roost! Type a message + Enter, or tap the menu.")
+    : String("WiFi failed - check SSS-FAMILY"), C_TEAL);
   chatFontIdx = save;                         // swap to preferred size
   draw();
   Serial.printf("[wifi] status=%d ip=%s\n", (int)WiFi.status(), WiFi.localIP().toString().c_str());
@@ -323,58 +453,112 @@ static int fontArgToIdx(const String& arg, int cur) {
   return pt <= 6 ? 0 : (pt <= 10 ? 1 : (pt <= 15 ? 2 : 3));
 }
 
+// command matches full name OR a >=3-char prefix (so /fon, /set, /col, /scr, /spl, /inp work)
+static bool cmdIs(const String& tok, const char* full) {
+  String f = full;
+  return tok == f || (tok.length() >= 3 && f.startsWith(tok));
+}
+// Apply a config command (from serial or an on-device "/..." message). Returns a
+// short status string for display; "" if the command was not recognized.
+static String applyCfgCmd(String s) {
+  s.trim();
+  int sp = s.indexOf(' ');
+  String tok = (sp < 0 ? s : s.substring(0, sp)); tok.toLowerCase();
+  String rest = (sp < 0 ? String("") : s.substring(sp + 1)); rest.trim();
+  if (cmdIs(tok, "settings")) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); return " "; }
+  if (cmdIs(tok, "font")) { chatFontIdx = fontArgToIdx(rest, chatFontIdx); saveCfg(); draw(); return String("chat font: ") + FONTS[chatFontIdx].name; }
+  if (cmdIs(tok, "inputfont")) { inputFontIdx = fontArgToIdx(rest, inputFontIdx); saveCfg(); draw(); return String("input font: ") + FONTS[inputFontIdx].name; }
+  if (cmdIs(tok, "color")) {
+    int p = rest.indexOf(' ');
+    if (p < 0) return "usage: /color user|ai <name>";
+    String who = rest.substring(0, p), name = rest.substring(p + 1); name.trim();
+    uint16_t col = namedColor(name);
+    if (col == 0xFFFF) return "colors: teal indigo amber red green cyan magenta orange ink dim";
+    if (who.startsWith("u")) userColor = col; else if (who.startsWith("a")) aiColor = col; else return "usage: /color user|ai <name>";
+    saveCfg(); draw(); return who + " color set";
+  }
+  if (cmdIs(tok, "scroll")) { scrollStep = constrain(rest.toInt(), 1, 20); saveCfg(); return String("scroll rate: ") + scrollStep; }
+  if (cmdIs(tok, "splash")) { splashMs = constrain(rest.toInt(), 0, 15000); saveCfg(); return String("splash: ") + splashMs + "ms"; }
+  return "";
+}
+
 void loop() {
-  // keyboard
+  static bool clkPrev = true; static uint32_t clkT = 0, lastTouch = 0;
+  uint32_t now = millis();
+
+  // trackball CLICK (GPIO0): chat -> open settings; settings -> activate selection
+  bool clk = digitalRead(TB_CLICK);
+  if (!clk && clkPrev && now - clkT > 220) {
+    clkT = now; Serial.println("[click]");
+    if (uiMode == MODE_CHAT) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
+    else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; drawSettings(); }
+    else activateSetting();
+  }
+  clkPrev = clk;
+
+  // trackball ROLL up/down (scroll in chat; move selection in settings)
+  bool u = digitalRead(TB_UP), d = digitalRead(TB_DOWN);
+  if (uiMode == MODE_CHAT) {
+    int before = scrollLines;
+    if (!u && tbUpPrev && now - lastScroll > 90) { scrollLines += scrollStep; lastScroll = now; }
+    if (!d && tbDnPrev && now - lastScroll > 90) { scrollLines -= scrollStep; lastScroll = now; }
+    if (scrollLines < 0) scrollLines = 0;
+    if (scrollLines != before) draw();
+  } else if (uiMode == MODE_SETTINGS) {
+    if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + N_SET) % N_SET; lastScroll = now; drawSettings(); }
+    if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % N_SET; lastScroll = now; drawSettings(); }
+  }
+  tbUpPrev = u; tbDnPrev = d;
+
+  // TOUCH — log coords (for calibration) + hit-test
+  if (now - lastTouch > 130) {
+    int rx = 0, ry = 0;
+    if (gtReadRaw(rx, ry)) {
+      int sx, sy; gtMap(rx, ry, sx, sy);
+      Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", rx, ry, sx, sy, uiMode);
+      lastTouch = now;
+      if (uiMode == MODE_CHAT) {
+        if (sy < headerH && sx > scrW - 26) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
+      } else if (uiMode == MODE_ABOUT) {
+        uiMode = MODE_SETTINGS; drawSettings();
+      } else {
+        setFont(1); int lh = tft.fontHeight() + 6; int row = (sy - (headerH + 4)) / lh;
+        if (row >= 0 && row < N_SET) { selIdx = row; activateSetting(); }
+      }
+    }
+  }
+
+  // KEYBOARD
   uint8_t k = readKey();
   if (k) {
-    if (k == '\r' || k == '\n') { if (input.length()) { String p = input; input = ""; sendPrompt(p); } }
+    if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; drawSettings(); }
+    else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
+    else if (k == '\r' || k == '\n') {
+      if (input.length()) {
+        String p = input; input = "";
+        if (p.startsWith("/")) {
+          String r = applyCfgCmd(p.substring(1));
+          if (uiMode == MODE_CHAT) { addMsg(r.length() ? r : ("unknown: " + p), C_DIM); scrollLines = 0; draw(); }
+        } else sendPrompt(p);
+      }
+    }
     else if (k == 8 || k == 127) { if (input.length()) { input.remove(input.length() - 1); draw(); } }
     else if (k >= 32 && k < 127) { input += (char)k; draw(); }
   }
-  // trackball scroll (falling edge = one detent)
-  bool u = digitalRead(TB_UP), d = digitalRead(TB_DOWN);
-  int beforeScroll = scrollLines;
-  uint32_t now = millis();
-  // falling edge (roll) + debounce; scrollStep is the adjustable rate
-  if (!u && tbUpPrev && now - lastScroll > 90) { scrollLines += scrollStep; lastScroll = now; }
-  if (!d && tbDnPrev && now - lastScroll > 90) { scrollLines -= scrollStep; lastScroll = now; }
-  tbUpPrev = u; tbDnPrev = d;
-  if (scrollLines < 0) scrollLines = 0;
-  if (scrollLines != beforeScroll) draw();
 
-  // serial dev commands
+  // SERIAL commands (ask/ip + settings nav for testing + config via applyCfgCmd)
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       String s = serialBuf; serialBuf = "";
       if (s.startsWith("ask ") || s.startsWith("claude "))
         sendPrompt(s.substring(s.indexOf(' ') + 1));
-      else if (s.startsWith("font ")) {
-        chatFontIdx = fontArgToIdx(s.substring(5), chatFontIdx); saveCfg();
-        Serial.printf("chat font=%s (saved)\n", FONTS[chatFontIdx].name); draw();
-      } else if (s.startsWith("inputfont ")) {
-        inputFontIdx = fontArgToIdx(s.substring(10), inputFontIdx); saveCfg();
-        Serial.printf("input font=%s (saved)\n", FONTS[inputFontIdx].name); draw();
-      } else if (s.startsWith("color ")) {
-        int sp = s.indexOf(' ', 6);
-        String who = s.substring(6, sp), name = s.substring(sp + 1); name.trim();
-        uint16_t col = namedColor(name);
-        if (col == 0xFFFF) Serial.println("colors: teal indigo amber red green cyan magenta orange ink dim");
-        else { if (who == "user") userColor = col; else if (who == "ai") aiColor = col;
-               saveCfg(); Serial.printf("%s color set (saved)\n", who.c_str()); draw(); }
-      } else if (s.startsWith("scroll ")) {
-        scrollStep = s.substring(7).toInt();
-        if (scrollStep < 1) scrollStep = 1; if (scrollStep > 20) scrollStep = 20;
-        saveCfg(); Serial.printf("scroll rate=%d lines/detent (saved)\n", scrollStep);
-      } else if (s.startsWith("splash ")) {
-        splashMs = s.substring(7).toInt();
-        if (splashMs < 0) splashMs = 0; if (splashMs > 15000) splashMs = 15000;
-        saveCfg(); Serial.printf("splash=%d ms (saved)\n", splashMs);
-      } else if (s == "settings" || s == "cfg") {
-        Serial.printf("chatFont=%s inputFont=%s scroll=%d splash=%dms\n",
-                      FONTS[chatFontIdx].name, FONTS[inputFontIdx].name, scrollStep, splashMs);
-      } else if (s == "ip")
-        Serial.printf("ip=%s status=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status());
+      else if (s == "ip")
+        Serial.printf("ip=%s status=%d mode=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode);
+      else if (s == "click") { if (uiMode == MODE_CHAT) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
+      else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % N_SET; drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
+      else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + N_SET) % N_SET; drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
+      else { String r = applyCfgCmd(s); Serial.println(r.length() ? r : "? (try: ask/font/color/scroll/splash/settings/ip)"); }
     } else serialBuf += c;
   }
   delay(8);
