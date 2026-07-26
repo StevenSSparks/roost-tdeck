@@ -248,6 +248,7 @@ static int selIdx = 0;
 // style: <=6 options each, item 0 is always Back). selIdx indexes the current page.
 enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_COUNT };
 static int setPage = PG_MAIN;
+static int setFirst = 0;     // first visible row (settings scroll window)
 static String setMsg = "";   // transient status line (e.g. provider switch result)
 static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
 static const int NPAL = 9;
@@ -396,6 +397,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("Map", locValid ? "gps" : (lastMapValid ? "saved" : "no fix"));
       row("Snake", ">");
       row("Sudoku", ">");
+      row("Slide 1-11", ">");
       row("GPS status", locValid ? String(locLat, 3) + "," + String(locLon, 3) : String("no fix"));
       return "Apps";
     case PG_DEVICE:
@@ -458,12 +460,20 @@ static void drawSettings() {
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   tft.setTextColor(C_INK, C_PANEL); tft.drawString(" " + title, 4 + tft.textWidth("RoostOS"), 4);
   setFont(1);   // small
-  int lh = tft.fontHeight() + 6, y = headerH + 6;
-  for (int i = 0; i < (int)labels.size(); i++) {
+  int lh = tft.fontHeight() + 6, y0 = headerH + 6;
+  int n = (int)labels.size();
+  int availH = (scrH - 14) - y0;
+  int rowsVis = availH / lh; if (rowsVis < 1) rowsVis = 1;
+  // scroll window so the selected row stays visible (handles long pages)
+  int first = 0;
+  if (n > rowsVis) { if (selIdx >= rowsVis) first = selIdx - rowsVis + 1;
+                     if (first > n - rowsVis) first = n - rowsVis; if (first < 0) first = 0; }
+  setFirst = first;
+  int y = y0;
+  for (int i = first; i < first + rowsVis && i < n; i++) {
     bool sel = (i == selIdx);
     if (sel) tft.fillRect(0, y - 2, scrW, lh, C_PANEL);
     uint16_t c = sel ? C_AMBER : C_INK;
-    // colour swatch preview on the Colors page
     if (setPage == PG_COLORS && i == 1 && !sel) c = userColor;
     if (setPage == PG_COLORS && i == 2 && !sel) c = aiColor;
     tft.setTextColor(c, sel ? C_PANEL : C_BG);
@@ -474,7 +484,10 @@ static void drawSettings() {
     }
     y += lh;
   }
-  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_AMBER, C_BG);
+  if (first > 0)              tft.drawString("^", scrW - 12, y0);
+  if (first + rowsVis < n)    tft.drawString("v", scrW - 12, scrH - 24);
+  tft.setTextColor(C_DIM, C_BG);
   if (setMsg.length()) tft.drawString(setMsg, 4, scrH - 12);
   else tft.drawString(setPage == PG_MAIN ? "ball: roll=move  click=open  (or /set)"
                                          : "ball: roll=move  click=change  < Back to return", 4, scrH - 12);
@@ -580,7 +593,8 @@ static void activateSetting() {
                 setMsg = "no location; use /map <lat> <lon>"; break;
         case 2: gameLaunch(0); return;   // Snake
         case 3: gameLaunch(1); return;   // Sudoku
-        case 4: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
+        case 4: gameLaunch(2); return;   // Slide
+        case 5: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
       }
       break;
     case PG_DISPLAY:
@@ -1101,6 +1115,7 @@ static String applyCfgCmd(String s) {
     return "game: snake | sudoku"; }
   if (tok == "snake")  { gameLaunch(0); return "snake"; }
   if (tok == "sudoku") { gameLaunch(1); return "sudoku"; }
+  if (tok == "slide")  { gameLaunch(2); return "slide"; }
   if (cmdIs(tok, "calibrate")) { startCalibration(); return "calibrate: tap the 3 targets on the screen"; }
   if (cmdIs(tok, "clear")) { clearChat(); return "chat cleared"; }
   if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
@@ -1438,9 +1453,54 @@ static void sudokuDraw() {
   }
   tft.setTextDatum(TL_DATUM);
 }
+// --- Sliding puzzle: tiles 1..11 on a 3x4 grid, one blank; tap a tile next to
+//     the gap to slide it. Shuffled via random legal moves (always solvable). ---
+static int slide[12];
+static int slideBlank() { for (int i = 0; i < 12; i++) if (slide[i] == 0) return i; return 11; }
+static void slideInit() {
+  for (int i = 0; i < 12; i++) slide[i] = (i < 11) ? i + 1 : 0;
+  int b = 11;
+  for (int n = 0; n < 300; n++) {
+    int nb[4], c = 0, r = b / 3, col = b % 3;
+    if (r > 0) nb[c++] = b - 3; if (r < 3) nb[c++] = b + 3;
+    if (col > 0) nb[c++] = b - 1; if (col < 2) nb[c++] = b + 1;
+    int t = nb[random(c)]; slide[b] = slide[t]; slide[t] = 0; b = t;
+  }
+}
+static bool slideWon() { for (int i = 0; i < 11; i++) if (slide[i] != i + 1) return false; return slide[11] == 0; }
+static void slideGeom(int& cw, int& ch, int& ox, int& oy) { cw = 90; ch = 52; ox = (scrW - cw * 3) / 2; oy = headerH + 4; }
+static void slideDraw() {
+  tft.fillScreen(C_BG); tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Slide 1-11", 4, 4);
+  bool won = slideWon();
+  tft.setTextColor(won ? C_TEAL : C_DIM, C_PANEL); tft.drawString(won ? "SOLVED!" : "tap a tile by the gap", 96, 4);
+  drawQuitX();
+  int cw, ch, ox, oy; slideGeom(cw, ch, ox, oy);
+  tft.setTextDatum(MC_DATUM);
+  for (int i = 0; i < 12; i++) {
+    if (slide[i] == 0) continue;
+    int x = ox + (i % 3) * cw, y = oy + (i / 3) * ch;
+    tft.fillRoundRect(x + 2, y + 2, cw - 4, ch - 4, 5, won ? C_TEAL : C_INDIGO);
+    tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_BG, won ? C_TEAL : C_INDIGO);
+    tft.drawString(String(slide[i]), x + cw / 2, y + ch / 2);
+    tft.setTextFont(1); tft.setTextSize(1);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+static void slideTap(int sx, int sy) {
+  int cw, ch, ox, oy; slideGeom(cw, ch, ox, oy);
+  if (sx < ox || sy < oy) return;
+  int c = (sx - ox) / cw, r = (sy - oy) / ch;
+  if (c < 0 || c > 2 || r < 0 || r > 3) return;
+  int idx = r * 3 + c, b = slideBlank(), br = b / 3, bc = b % 3;
+  if ((r == br && abs(c - bc) == 1) || (c == bc && abs(r - br) == 1)) { slide[b] = slide[idx]; slide[idx] = 0; slideDraw(); }
+}
 static void gameLaunch(int which) {
   gGame = which; uiMode = MODE_GAME;
-  if (which == 0) { snakeInit(); snakeDraw(); } else { sudokuInit(); sudokuDraw(); }
+  if (which == 0)      { snakeInit();  snakeDraw(); }
+  else if (which == 1) { sudokuInit(); sudokuDraw(); }
+  else                 { slideInit();  slideDraw(); }
 }
 static void gameKey(uint8_t k) {
   if (k == 'q' || k == 27) { uiMode = MODE_CHAT; draw(); return; }
@@ -1550,11 +1610,11 @@ void loop() {
             if (!suGiven[suCur]) su[suCur] = (d < 9) ? d + 1 : 0;   // 1-9 or C=clear
             sudokuDraw();
           }
-        }
+        } else if (gGame == 2) slideTap(sx, sy);   // sliding puzzle
       } else if (uiMode == MODE_ABOUT) {
         uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
       } else if (uiMode == MODE_SETTINGS) {
-        setFont(1); int lh = tft.fontHeight() + 6; int row = (sy - (headerH + 4)) / lh;
+        setFont(1); int lh = tft.fontHeight() + 6; int row = setFirst + (sy - (headerH + 4)) / lh;
         if (row >= 0 && row < pageLen(setPage)) { selIdx = row; activateSetting(); }
       }
     }
