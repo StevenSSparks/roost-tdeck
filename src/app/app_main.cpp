@@ -67,7 +67,7 @@ static const char* PROVIDERS[] = {"anthropic", "openai", "gemini", "ollama"};
 static const int NPROV = 4;
 static String defaultModel(const String& p) {
   if (p == "openai") return "gpt-4o-mini";
-  if (p == "gemini") return "gemini-2.0-flash-lite";   // small/cheap (demo key)
+  if (p == "gemini") return "gemini-flash-lite-latest";   // cheap alias, won't go stale
   if (p == "ollama") return "llama3.2";
   return "claude-haiku-4-5";
 }
@@ -548,7 +548,7 @@ static void drawAbout() {
 static String nextModel(const String& p, const String& cur) {
   const char* an[] = {"claude-haiku-4-5", "claude-sonnet-4-6"};
   const char* oa[] = {"gpt-4o-mini", "gpt-4o"};
-  const char* ge[] = {"gemini-2.0-flash-lite", "gemini-2.0-flash"};
+  const char* ge[] = {"gemini-flash-lite-latest", "gemini-2.5-flash"};
   const char* ol[] = {"llama3.2", "qwen2.5", "phi3"};
   const char** L; int n;
   if (p == "openai")      { L = oa; n = 2; }
