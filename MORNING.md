@@ -80,3 +80,10 @@ Now on the device (env:app):
   or if a different axis scrolls, and I'll remap.
 - Your favorite **message/input font sizes + colors** → I'll make them the defaults
   and add the **Settings** screen to persist everything (NVS).
+
+### More backlog (requested)
+- **Games:** Snake (trackball/touch steer), Sudoku (QWERTY digits + cursor). Post-M1 fun.
+- **Touch (GT911):** capacitive swipe up/down to scroll chat; becomes the primary
+  input (trackball optional) — enables touch buttons + game controls. INT on GPIO16.
+- Fun note: the device's own Haiku suggested "Tetris/Snake" unprompted when asked for
+  fun uses — it's writing its own roadmap.
