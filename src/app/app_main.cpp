@@ -172,6 +172,8 @@ static int batteryPct() {
   int pct = (int)(((long)mv - 3300) * 100 / (4200 - 3300));
   return pct < 0 ? 0 : pct > 100 ? 100 : pct;
 }
+// Approximate charging detection: on USB the pack reads high (no dedicated pin).
+static bool batteryCharging() { return analogReadMilliVolts(4) * 2 > 4250; }
 // wifi signal level 0..4 from RSSI
 static int wifiLevel() {
   if (WiFi.status() != WL_CONNECTED) return 0;
@@ -344,34 +346,42 @@ static void draw() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   int rx = 4 + tft.textWidth("RoostOS");
-  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" AI", rx, 4);   // compact; full name on splash/banner
+  // per-mode title (always starts with RoostOS)
+  const char* suffix = (statusMode == STAT_DEMO) ? " AI Communicator"
+                     : (statusMode == STAT_PHONE) ? " AI" : " Communicator";
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(suffix, rx, 4);
   // menu button (hamburger) top-right — tap to open Settings
   for (int b = 0; b < 3; b++) tft.fillRect(scrW - 20, 3 + b * 4, 15, 2, C_AMBER);
   int rEdge = scrW - 24;   // content ends left of the menu button
-  auto drawBars = [&](int x)->int {                 // wifi bars, returns left x used
+  auto drawBars = [&](int x) {                      // 4 wifi bars at [x..x+15]
     int lvl = wifiLevel();
     for (int i = 0; i < 4; i++) { int h = 3 + i * 2;
       tft.fillRect(x + i * 4, 11 - h, 3, h, i < lvl ? C_TEAL : C_PANEL);
       tft.drawRect(x + i * 4, 11 - h, 3, h, i < lvl ? C_TEAL : C_DIM); }
-    return x;
+  };
+  auto drawBatt = [&](int rightX) -> int {          // battery pill; returns its left x
+    int bpct = batteryPct(); bool chg = batteryCharging();
+    int w = 18, h = 9, x = rightX - w, y = 3;
+    tft.drawRect(x, y, w, h, C_DIM); tft.fillRect(x + w, y + 2, 2, h - 4, C_DIM);  // nub
+    int fill = (w - 2) * bpct / 100;
+    tft.fillRect(x + 1, y + 1, fill, h - 2, chg ? C_TEAL : (bpct <= 15 ? C_AMBER : C_INK));
+    if (chg) { tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("+", x - 6, 4); }  // charging
+    return x - (chg ? 8 : 2);
   };
   tft.setTextColor(C_DIM, C_PANEL);
-  if (WiFi.status() != WL_CONNECTED && statusMode != STAT_PHONE) {
-    String s = "WiFi down"; tft.drawString(s, rEdge - tft.textWidth(s), 4);
-  } else if (statusMode == STAT_IP) {               // SSID + IP
-    String s = WiFi.SSID() + " " + WiFi.localIP().toString();
+  if (statusMode == STAT_IP) {                      // SSID + IP (dev/info)
+    String s = WiFi.status() == WL_CONNECTED ? (WiFi.SSID() + " " + WiFi.localIP().toString()) : String("WiFi down");
     tft.drawString(s, rEdge - tft.textWidth(s), 4);
-  } else if (statusMode == STAT_DEMO) {             // "Demo" + bars (no ssid/ip)
+  } else if (statusMode == STAT_DEMO) {             // bars + battery (no SSID/IP) — photo-friendly
     int bx = rEdge - 16; drawBars(bx);
-    String s = "Demo"; tft.drawString(s, bx - 6 - tft.textWidth(s), 4);
-  } else {                                          // PHONE: bars + battery% + clock
+    drawBatt(bx - 6);
+  } else {                                          // PHONE: clock + battery + bars
     int bx = rEdge - 16; drawBars(bx);
-    int bpct = batteryPct(); String bs = String(bpct) + "%";
-    int batX = bx - 6 - tft.textWidth(bs); tft.drawString(bs, batX, 4);
+    int batLeft = drawBatt(bx - 6);
     time_t nowt = time(nullptr);
     if (nowt > 1700000000) { nowt += (time_t)tzOffsetMin * 60; struct tm tmv; gmtime_r(&nowt, &tmv);
       char c[8]; strftime(c, sizeof(c), "%H:%M", &tmv);
-      tft.drawString(c, batX - 6 - tft.textWidth(c), 4); }
+      tft.setTextColor(C_DIM, C_PANEL); tft.drawString(c, batLeft - 4 - tft.textWidth(c), 4); }
   }
 
   // input-box metrics (its own font)
@@ -579,20 +589,22 @@ static void drawAbout() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   tft.setTextColor(C_INK, C_PANEL); tft.drawString(" About", 4 + tft.textWidth("RoostOS"), 4);
-  setFont(1);
-  int y = headerH + 6, lh = tft.fontHeight() + 4;
-  auto row = [&](const String& a, const String& b) {
+  setFont(0);   // tiny GLCD so all rows fit without scrolling
+  int y = headerH + 5, lh = tft.fontHeight() + 4;
+  auto row = [&](const String& a, const String& b, uint16_t bc = 0) {
     tft.setTextColor(C_DIM, C_BG); tft.drawString(a, 6, y);
-    tft.setTextColor(C_INK, C_BG); tft.drawString(b, 96, y); y += lh;
+    tft.setTextColor(bc ? bc : C_INK, C_BG); tft.drawString(b, 88, y); y += lh;
   };
+  row("Product", "RoostOS Communicator", C_TEAL);
+  row("Web", "roostos.dev/tdeck", C_AMBER);
+  row("GitHub", "github.com/StevenSSparks/roost-tdeck", C_AMBER);
   row("Version", ROOST_COMM_VERSION);
   row("Device", "T-Deck Plus (S3)");
   row("MAC", WiFi.macAddress());
   row("IP", WiFi.localIP().toString());
   row("WiFi", dispSsid() + " " + String(WiFi.RSSI()) + "dBm");
   row("Status bar", statusName());
-  row("Heap", String(ESP.getFreeHeap() / 1024) + "K free");
-  row("PSRAM", String(ESP.getFreePsram() / 1024) + "K free");
+  row("Heap/PSRAM", String(ESP.getFreeHeap() / 1024) + "K / " + String(ESP.getFreePsram() / 1024) + "K");
   row("Uptime", String(millis() / 1000) + "s");
   row("Touch", gtAddr ? "GT911 0x" + String(gtAddr, HEX) : "none");
   tft.setTextColor(C_AMBER, C_BG); tft.drawString("tap / any key = back", 4, scrH - 12);
@@ -1380,7 +1392,7 @@ static Print* shellOut = nullptr;
 static void shellPrint(const String& s) { if (shellOut) shellOut->print(s); }
 static void shellPrompt() { shellPrint("\r\nroost> "); }
 static void shellBanner() {
-  shellPrint(String("\r\n=== RoostOS AI Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
+  shellPrint(String("\r\n=== RoostOS Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
   shellPrint("A handheld AI communicator. You're connected over the network.\r\n");
   shellPrint("Just type to chat. Commands: /help  /set  /get  /quit\r\n");
 }
