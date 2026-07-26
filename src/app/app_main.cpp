@@ -133,6 +133,9 @@ static double  locLat = 0, locLon = 0; static bool locValid = false;
 static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
 // last map shown (persisted) so /map can reopen it without a GPS fix
 static double  lastMapLat = 0, lastMapLon = 0; static bool lastMapValid = false;
+// touch calibration: screen = affine(raw). Defaults to identity (uncalibrated).
+static float   tcAx = 1, tcBx = 0, tcCx = 0, tcAy = 0, tcBy = 1, tcCy = 0;
+static bool    touchCalValid = false;
 static TinyGPSPlus gps;
 static HardwareSerial GPSser(1);
 // TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
@@ -179,6 +182,9 @@ static void saveCfg() {
   prefs.putDouble("mapLat", lastMapLat);
   prefs.putDouble("mapLon", lastMapLon);
   prefs.putBool("mapVal", lastMapValid);
+  prefs.putBool("tcVal2", touchCalValid);
+  prefs.putFloat("tcAx", tcAx); prefs.putFloat("tcBx", tcBx); prefs.putFloat("tcCx", tcCx);
+  prefs.putFloat("tcAy", tcAy); prefs.putFloat("tcBy", tcBy); prefs.putFloat("tcCy", tcCy);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -211,6 +217,11 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   lastMapLat   = prefs.getDouble("mapLat", 0);
   lastMapLon   = prefs.getDouble("mapLon", 0);
   lastMapValid = prefs.getBool("mapVal", false);
+  touchCalValid = prefs.getBool("tcVal2", false);
+  if (touchCalValid) {
+    tcAx = prefs.getFloat("tcAx", 1); tcBx = prefs.getFloat("tcBx", 0); tcCx = prefs.getFloat("tcCx", 0);
+    tcAy = prefs.getFloat("tcAy", 0); tcBy = prefs.getFloat("tcBy", 1); tcCy = prefs.getFloat("tcCy", 0);
+  }
   prefs.end();
 }
 
@@ -230,7 +241,7 @@ static uint16_t namedColor(const String& n) {
 }
 
 // ---- screen modes ----
-enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT, MODE_TEXT, MODE_WIFI, MODE_MAP, MODE_GAME };
+enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT, MODE_TEXT, MODE_WIFI, MODE_MAP, MODE_GAME, MODE_CALIB };
 static int uiMode = MODE_CHAT;
 static int selIdx = 0;
 // Settings are organized as a main page with per-category sub-pages (BlackBerry
@@ -353,6 +364,7 @@ static String activeSsid();
 static void draw();
 static void showMap(double lat, double lon, int zoom);
 static void gameLaunch(int which);
+static void startCalibration();
 
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
@@ -382,6 +394,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("Sounds", soundsOn ? "on" : "off");
       row("Trackball", trackballOn ? "on" : "off");
       row("Web search", webSearchOn ? "on" : "off");
+      row("Calibrate touch", touchCalValid ? "done" : "needed");
       return "Device";
     case PG_DISPLAY:
       row("< Back", "");
@@ -598,6 +611,7 @@ static void activateSetting() {
         case 4: soundsOn    = !soundsOn;    break;
         case 5: trackballOn = !trackballOn; break;
         case 6: webSearchOn = !webSearchOn; break;
+        case 7: startCalibration(); return;   // Calibrate touch
       }
       break;
     case PG_SYSTEM:
@@ -804,28 +818,88 @@ static void gtProbe() {
   }
   Serial.printf("[touch] GT911 addr=0x%02X\n", gtAddr);
 }
+// Read a GT911 16-bit register block using a repeated-START (no STOP between the
+// address write and the read) — required for correct byte alignment.
+static bool gtRead(uint16_t reg, uint8_t* out, uint8_t n) {
+  Wire.beginTransmission(gtAddr);
+  Wire.write((uint8_t)(reg >> 8)); Wire.write((uint8_t)(reg & 0xFF));
+  if (Wire.endTransmission(false) != 0) return false;   // repeated start
+  uint8_t got = Wire.requestFrom(gtAddr, n);
+  for (uint8_t i = 0; i < n && Wire.available(); i++) out[i] = Wire.read();
+  return got == n;
+}
+static void gtWrite(uint16_t reg, uint8_t val) {
+  Wire.beginTransmission(gtAddr);
+  Wire.write((uint8_t)(reg >> 8)); Wire.write((uint8_t)(reg & 0xFF)); Wire.write(val);
+  Wire.endTransmission();
+}
 // Read one touch point. Returns raw controller coords in rx/ry; false if no touch.
 static bool gtReadRaw(int& rx, int& ry) {
   if (!gtAddr) return false;
-  Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x4E);
-  if (Wire.endTransmission() != 0) return false;
-  Wire.requestFrom(gtAddr, (uint8_t)1);
-  if (!Wire.available()) return false;
-  uint8_t st = Wire.read();
-  bool touched = (st & 0x80) && (st & 0x0F);
-  if (touched) {
-    Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x50);
-    Wire.endTransmission();
-    Wire.requestFrom(gtAddr, (uint8_t)8);
-    uint8_t b[8]; int i = 0; while (Wire.available() && i < 8) b[i++] = Wire.read();
-    if (i >= 5) { rx = b[1] | (b[2] << 8); ry = b[3] | (b[4] << 8); }
+  uint8_t st = 0;
+  if (!gtRead(0x814E, &st, 1)) return false;    // GT_POINT_INFO
+  bool ready = st & 0x80, touched = false;
+  if (ready && (st & 0x0F)) {
+    uint8_t p[6];
+    if (gtRead(0x8150, p, 6)) {                 // point 1 coords: xL,xH,yL,yH,szL,szH
+      rx = p[0] | (p[1] << 8); ry = p[2] | (p[3] << 8); touched = true;
+    }
   }
-  Wire.beginTransmission(gtAddr); Wire.write(0x81); Wire.write(0x4E); Wire.write(0);
-  Wire.endTransmission();
+  if (ready) gtWrite(0x814E, 0);                // clear buffer-status flag
   return touched;
 }
-// Map raw touch -> screen coords for TFT rotation 1. FIRST GUESS — calibrated from serial logs.
-static void gtMap(int rx, int ry, int& sx, int& sy) { sx = rx; sy = ry; }
+// Map raw GT911 coords -> screen coords via the calibrated affine transform.
+// Uncalibrated defaults are identity (a runtime calibration wizard sets these).
+static void gtMap(int rx, int ry, int& sx, int& sy) {
+  sx = (int)(tcAx * rx + tcBx * ry + tcCx);
+  sy = (int)(tcAy * rx + tcBy * ry + tcCy);
+  if (sx < 0) sx = 0; if (sx >= scrW) sx = scrW - 1;
+  if (sy < 0) sy = 0; if (sy >= scrH) sy = scrH - 1;
+}
+
+// ---- 3-point touch calibration wizard (MODE_CALIB) ----
+// Solve s = a*rx + b*ry + c from three (rx,ry)->s samples (Cramer's rule).
+static bool solve3(const float rx[3], const float ry[3], const float s[3],
+                   float& a, float& b, float& c) {
+  float det = rx[0]*(ry[1]-ry[2]) - ry[0]*(rx[1]-rx[2]) + (rx[1]*ry[2]-rx[2]*ry[1]);
+  if (fabsf(det) < 1e-3f) return false;
+  float da = s[0]*(ry[1]-ry[2]) - ry[0]*(s[1]-s[2]) + (s[1]*ry[2]-s[2]*ry[1]);
+  float db = rx[0]*(s[1]-s[2]) - s[0]*(rx[1]-rx[2]) + (rx[1]*s[2]-rx[2]*s[1]);
+  float dc = rx[0]*(ry[1]*s[2]-s[1]*ry[2]) - ry[0]*(rx[1]*s[2]-s[1]*rx[2]) + s[0]*(rx[1]*ry[2]-rx[2]*ry[1]);
+  a = da/det; b = db/det; c = dc/det; return true;
+}
+static int   calStep = 0;
+static long  calAccX = 0, calAccY = 0; static int calAccN = 0;   // press accumulator
+static float calRX[3], calRY[3], calTX[3], calTY[3];
+static void drawCalTarget() {
+  tft.fillScreen(C_BG); tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_INK, C_BG);
+  tft.drawString("Touch calibration", scrW/2, 26);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("tap each target (" + String(calStep+1) + "/3)", scrW/2, 44);
+  int x = (int)calTX[calStep], y = (int)calTY[calStep];
+  tft.drawCircle(x, y, 10, C_AMBER); tft.drawCircle(x, y, 2, C_AMBER);
+  tft.drawFastHLine(x-14, y, 28, C_TEAL); tft.drawFastVLine(x, y-14, 28, C_TEAL);
+}
+static void startCalibration() {
+  uiMode = MODE_CALIB; calStep = 0; calAccX = calAccY = 0; calAccN = 0;
+  calTX[0] = 30;        calTY[0] = 30;
+  calTX[1] = scrW - 30; calTY[1] = 30;
+  calTX[2] = 30;        calTY[2] = scrH - 30;
+  drawCalTarget();
+}
+static void calRecord(int rx, int ry) {   // called on a discrete tap during MODE_CALIB
+  calRX[calStep] = rx; calRY[calStep] = ry; calStep++;
+  if (calStep < 3) { drawCalTarget(); return; }
+  float ax,bx,cx,ay,by,cy;
+  bool ok = solve3(calRX, calRY, calTX, ax, bx, cx) &&
+            solve3(calRX, calRY, calTY, ay, by, cy);
+  if (ok) { tcAx=ax; tcBx=bx; tcCx=cx; tcAy=ay; tcBy=by; tcCy=cy;
+            touchCalValid = true; saveCfg();
+            Serial.printf("[cal] ok ax=%.4f bx=%.4f cx=%.1f ay=%.4f by=%.4f cy=%.1f\n", ax,bx,cx,ay,by,cy);
+            uiMode = MODE_CHAT; draw(); }
+  else { Serial.println("[cal] degenerate - restarting"); calStep = 0; drawCalTarget(); }   // retry
+}
 
 // Active credentials: on-device override (Settings) wins over secrets.h defaults.
 static String activeSsid() { return wifiSsid.length() ? wifiSsid : String(DEFAULT_WIFI_SSID); }
@@ -1015,6 +1089,7 @@ static String applyCfgCmd(String s) {
     return "game: snake | sudoku"; }
   if (tok == "snake")  { gameLaunch(0); return "snake"; }
   if (tok == "sudoku") { gameLaunch(1); return "sudoku"; }
+  if (cmdIs(tok, "calibrate")) { startCalibration(); return "calibrate: tap the 3 targets on the screen"; }
   if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
   if (cmdIs(tok, "key")) {   // /key anthropic|openai|gemini <api-key>
     int p = rest.indexOf(' ');
@@ -1391,15 +1466,27 @@ void loop() {
   }
   tbUpPrev = u; tbDnPrev = d;
 
-  // TOUCH — log coords (for calibration) + hit-test
-  if (now - lastTouch > 130) {
+  // CALIBRATION capture: sample every loop, average a press, commit on release
+  // The GT911 "data ready" flag clears on each read, so a single poll flickers
+  // true/false while a finger is held. Debounce with hysteresis: latch the first
+  // good read as a press, act once, and only treat it as released after ~160ms
+  // with no touch. This fixes both missed quick taps and menu flip-flop.
+  {
+    static bool tPressed = false, tActed = false;
+    static uint32_t tSeen = 0; static int tRX = 0, tRY = 0;
     int rx = 0, ry = 0;
-    if (gtReadRaw(rx, ry)) {
-      int sx, sy; gtMap(rx, ry, sx, sy);
-      Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", rx, ry, sx, sy, uiMode);
-      lastTouch = now;
+    if (gtReadRaw(rx, ry)) { tSeen = now; tRX = rx; tRY = ry; if (!tPressed) { tPressed = true; tActed = false; } }
+    else if (tPressed && now - tSeen > 160) tPressed = false;   // debounced release
+    bool justPressed = tPressed && !tActed;
+
+    if (uiMode == MODE_CALIB) {
+      if (justPressed) { tActed = true; Serial.printf("[cal] TAP step %d raw=%d,%d\n", calStep, tRX, tRY); calRecord(tRX, tRY); }
+    } else if (justPressed) {
+      tActed = true;
+      int sx, sy; gtMap(tRX, tRY, sx, sy);
+      Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", tRX, tRY, sx, sy, uiMode);
       if (uiMode == MODE_CHAT) {
-        if (sy < headerH && sx > scrW - 26) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
+        if (sy < 40) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // tap top ~40px = menu
       } else if (uiMode == MODE_MAP || uiMode == MODE_GAME) {
         uiMode = MODE_CHAT; draw();                 // tap closes map / game
       } else if (uiMode == MODE_ABOUT) {
@@ -1429,6 +1516,7 @@ void loop() {
       else if (k >= 32 && k < 127) { textVal += (char)k; drawText(); }
     }
     else if (uiMode == MODE_GAME) { gameKey(k); }
+    else if (uiMode == MODE_CALIB) { uiMode = MODE_CHAT; draw(); }      // any key cancels calibration
     else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }        // any key exits map
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
