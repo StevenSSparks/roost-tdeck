@@ -23,7 +23,10 @@ Claude over WiFi on a pocket QWERTY device with a real screen. Part of the
   GPS or any coordinates (`/map <lat> <lon>`). The AI can **show you a map** by
   calling a `show_map` tool (e.g. *"show me a map of Paris"*).
 - **GPS** (L76K) for location + time; **NTP** time sync so the AI is time-aware.
-- **Games** 🐍 — Snake (trackball/WASD) and Sudoku (QWERTY).
+- **Games** 🐍 — Snake (trackball/WASD), Sudoku (touch: tap a cell + number pad,
+  10 boards), and a Slide 1-11 tile puzzle.
+- **Touchscreen** — calibratable (Settings → Device → Calibrate touch, or
+  `/calibrate`): tap the top bar for the menu, tap Settings rows, tap to play.
 - **Configure from a terminal** — chat with the AI and change every setting over
   **USB-C serial** or a **network shell** (see below). Flash with just WiFi, then
   paste your API keys over the shell — no rebuild.
@@ -145,14 +148,16 @@ Then, in either:
 | `native`| Off-device unit tests: `pio test -e native`. |
 
 ## Roadmap
-**Done:** multi-provider chat · categorized Settings · on-screen maps + AI
-`show_map` · GPS + NTP time-awareness · terminal chat/config over USB-C and TCP ·
-runtime key config (no rebuild) · Snake + Sudoku · on-device WiFi + personalization.
+**Done:** multi-provider chat · categorized + scrolling Settings · on-screen maps
++ AI `show_map` · GPS + NTP time-awareness · terminal chat/config over USB-C and
+TCP · real **SSH** server · runtime key config (no rebuild) · **working touch**
+(GT911 fix + calibration) · Snake, Sudoku (touch), Slide 1-11 · on-device WiFi +
+personalization.
 
-**Next:** **touch** (GT911) calibration → tap Settings + swipe scroll ·
-turn-by-turn **directions** · SSH key-based auth · battery ADC calibration ·
-custom boot artwork · WiFi auto-reconnect · web search. See `MORNING.md` and
-`docs/superpowers/plans/` for the working plan.
+**Next:** verify the SSH handshake end-to-end (needs Wi-Fi AP-isolation off) ·
+swipe-to-scroll chat via touch · turn-by-turn **directions** · battery ADC
+calibration · custom boot artwork · WiFi auto-reconnect · web search. See
+`MORNING.md` and `docs/superpowers/plans/` for the working plan.
 
 ## Safety
 No secrets are ever committed. Stock firmware can be backed up before flashing
