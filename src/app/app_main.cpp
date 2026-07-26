@@ -55,10 +55,10 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 #define GEOAPIFY_KEY ""
 #endif
 #ifndef SSH_USER
-#define SSH_USER ""
+#define SSH_USER "roost"
 #endif
 #ifndef SSH_PASS
-#define SSH_PASS ""
+#define SSH_PASS "roostos"
 #endif
 #ifndef ANTHROPIC_API_KEY
 #define ANTHROPIC_API_KEY ""
@@ -463,6 +463,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("Display", ">"); row("Colors", ">");
       row("AI Provider", aiProvider);
       row("Device", ">");
+      row("SSH", sshOn ? "on :22" : "off");
       row("System / About", ">");
       return "Settings";
     case PG_APPS:
@@ -514,7 +515,6 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("About", ">");
       row("WiFi setup", WiFi.isConnected() ? dispSsid() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
-      row("SSH server", sshOn ? "on :22" : "off");
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
@@ -675,12 +675,13 @@ static void activateSetting() {
       case 3: setPage = PG_COLORS;  selIdx = 0; break;
       case 4: setPage = PG_AI;      selIdx = 0; break;
       case 5: setPage = PG_DEVICE;  selIdx = 0; break;
-      case 6: setPage = PG_SYSTEM;  selIdx = 0; break;
+      case 6: setPage = PG_SSH;     selIdx = 0; break;
+      case 7: setPage = PG_SYSTEM;  selIdx = 0; break;
     }
     drawSettings(); return;
   }
-  // sub-pages: item 0 is Back (SSH lives under System; others under Main)
-  if (selIdx == 0) { setPage = (setPage == PG_SSH) ? PG_SYSTEM : PG_MAIN; selIdx = 0; drawSettings(); return; }
+  // sub-pages: item 0 is Back to the main page
+  if (selIdx == 0) { setPage = PG_MAIN; selIdx = 0; drawSettings(); return; }
 
   switch (setPage) {
     case PG_APPS:
@@ -757,10 +758,9 @@ static void activateSetting() {
             });
           return;
         case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
-        case 4: setPage = PG_SSH; selIdx = 0; break;                    // SSH server -> its own page
-        case 5:  // Map key entry
+        case 4:  // Map key entry (SSH moved to the main settings page)
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 4; });
           return;
         // IP / Uptime rows are read-only status
       }
