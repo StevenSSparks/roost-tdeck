@@ -54,6 +54,12 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 #ifndef GEOAPIFY_KEY
 #define GEOAPIFY_KEY ""
 #endif
+#ifndef SSH_USER
+#define SSH_USER "roost"
+#endif
+#ifndef SSH_PASS
+#define SSH_PASS "roostos"
+#endif
 #ifndef ANTHROPIC_API_KEY
 #define ANTHROPIC_API_KEY ""
 #endif
@@ -125,7 +131,7 @@ static bool    webSearchOn = false;                // allow AI web search (roadm
 static bool    remoteShellOn = false;              // TCP shell on port 23
 static bool    demoMode = false;                   // mask WiFi SSID as "Demo" for photos
 static bool    sshOn = false;                      // real SSH server on port 22
-static String  sshUser = "roost", sshPass = "roostos";   // SSH login
+static String  sshUser = SSH_USER, sshPass = SSH_PASS;   // SSH login (from secrets, editable)
 static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 // WiFi override set on-device (empty => fall back to secrets.h DEFAULT_WIFI_*)
 static String  wifiSsid = "", wifiPass = "";
@@ -459,6 +465,8 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("WiFi setup", WiFi.isConnected() ? dispSsid() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
       row("SSH server", sshOn ? "on :22" : "off");
+      row("SSH user", sshUser);
+      row("SSH pass", sshPass);
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
@@ -574,6 +582,10 @@ static void drawText() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   tft.setTextColor(C_INK, C_PANEL);  tft.drawString(" " + textTitle, 4 + tft.textWidth("RoostOS"), 4);
+  // [X] cancel button (top-right) — the keyboard has no Esc key
+  tft.drawRect(scrW - 16, 1, 14, headerH - 2, C_DIM);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(C_AMBER, C_PANEL);
+  tft.drawString("X", scrW - 9, headerH / 2); tft.setTextDatum(TL_DATUM);
   setFont(1);
   int y = headerH + 18;
   tft.setTextColor(C_DIM, C_BG); tft.drawString(textHint.length() ? textHint : String("type, then Enter"), 8, y);
@@ -587,7 +599,7 @@ static void drawText() {
   while (shown.length() && tft.textWidth(shown) > scrW - 30 - pw) shown = shown.substring(1);
   tft.drawString(shown + "_", 10 + pw, y + 2);
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
-  tft.drawString("Enter = save    Esc = cancel", 4, scrH - 12);
+  tft.drawString("Enter = save    tap X / click ball = cancel", 4, scrH - 12);
 }
 static void openText(const String& title, const String& initial, const String& hint,
                      bool mask, int returnMode, std::function<void(String)> cb) {
@@ -688,9 +700,17 @@ static void activateSetting() {
           return;
         case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
         case 4: sshOn = !sshOn; break;                                  // SSH server toggle
-        case 5:  // Map key entry
+        case 5:  // SSH user
+          openText("SSH user", sshUser, "login name for ssh", false, MODE_SETTINGS,
+                   [](String v){ sshUser = v.length() ? v : String("roost"); saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
+          return;
+        case 6:  // SSH password (shown in cleartext by request)
+          openText("SSH password", sshPass, "password for ssh login", false, MODE_SETTINGS,
+                   [](String v){ sshPass = v.length() ? v : String("roostos"); saveCfg(); setPage = PG_SYSTEM; selIdx = 6; });
+          return;
+        case 7:  // Map key entry
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 7; });
           return;
         // IP / Uptime rows are read-only status
       }
@@ -1627,7 +1647,9 @@ void loop() {
     if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }
-    else activateSetting();
+    else if (uiMode == MODE_TEXT) { uiMode = textReturnMode;   // click = cancel text entry
+      if (uiMode == MODE_SETTINGS) drawSettings(); else draw(); }
+    else if (uiMode != MODE_GAME) activateSetting();   // (games handle click via their own touch)
   }
   clkPrev = clk;
 
@@ -1708,6 +1730,10 @@ void loop() {
             sudokuDraw();
           }
         } else if (gGame == 2) slideTap(sx, sy);   // sliding puzzle
+      } else if (uiMode == MODE_TEXT) {
+        if (sy < headerH + 4 && sx > scrW - 18) {   // tap [X] = cancel entry
+          uiMode = textReturnMode; if (uiMode == MODE_SETTINGS) drawSettings(); else draw();
+        }
       } else if (uiMode == MODE_ABOUT) {
         uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
       } else if (uiMode == MODE_SETTINGS) {
