@@ -53,3 +53,30 @@ vision runs on real hardware.
 
 Plan + full task ledger: `docs/superpowers/plans/2026-07-25-roostos-communicator-m1.md`
 and `.superpowers/sdd/.../progress.md`.
+
+---
+
+## Update — richer chat UX (later that night)
+Now on the device (env:app):
+- **Branded boot splash** (RoostOS wordmark + drawn chick-on-antenna). Swap in real
+  chick artwork later (hand me a PNG → I convert + embed).
+- **Smooth fonts** (FreeSans), separate sizes for **messages** and the **input box**.
+- **Configurable colors** for your messages and Haiku's (yellow prompt kept).
+- **Scrollback**: roll the **trackball up/down** to scroll chat history (a "^ more"
+  hint shows when scrolled up). After each send, your message stays visible at the
+  top of the exchange.
+- Plain-text replies (told Haiku no markdown/emoji for the pixel screen).
+
+### Serial dev commands (`pio device monitor -e app`)
+- `ask <text>` — chat (also type on the keyboard + Enter)
+- `font <tiny|small|medium|large>` or `font <9|12|18>` — message size
+- `inputfont <...>` — input-box size
+- `color user <name>` / `color ai <name>` — names: teal indigo amber red green cyan magenta orange ink dim
+- `ip`
+
+### Please check in the morning
+- **Keyboard typing** works? (no arrow keys on this pad — trackball is the scroller)
+- **Trackball scroll** direction — I guessed pin3=up/pin2=down; tell me if reversed
+  or if a different axis scrolls, and I'll remap.
+- Your favorite **message/input font sizes + colors** → I'll make them the defaults
+  and add the **Settings** screen to persist everything (NVS).
