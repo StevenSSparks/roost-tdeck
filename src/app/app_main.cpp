@@ -530,19 +530,19 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("< Back", "");
       row("About", ">");
       row("WiFi setup", WiFi.isConnected() ? dispSsid() : String("down"));
-      row("Remote shell", remoteShellOn ? "on :23" : "off");
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
       return "System";
     case PG_SSH:
       row("< Back", "");
-      row("Enabled", sshOn ? "on :22" : "off");
+      row("SSH server", sshOn ? "on :22" : "off");
+      row("TCP shell", remoteShellOn ? "on :23" : "off");
       row("User", sshUser.length() ? sshUser : String("(unset)"));
       row("Password", sshPass.length() ? sshPass : String("(unset)"));
       row("Connect", WiFi.isConnected() ? ("ssh " + (sshUser.length() ? sshUser : String("user")) + "@" + WiFi.localIP().toString()) : String("wifi down"));
       row("Regen host key", ">");
-      return "SSH";
+      return "Remote / SSH";
   }
   return "Settings";
 }
@@ -773,27 +773,27 @@ static void activateSetting() {
                 });
             });
           return;
-        case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
-        case 4:  // Map key entry (SSH moved to the main settings page)
+        case 3:  // Map key entry (SSH + TCP shell moved to the SSH page)
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 4; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 3; });
           return;
         // IP / Uptime rows are read-only status
       }
       break;
     case PG_SSH:
       switch (selIdx) {
-        case 1: sshOn = !sshOn; break;   // Enabled toggle (only starts if creds set)
-        case 2:  // User
+        case 1: sshOn = !sshOn; break;                 // SSH server (encrypted, :22)
+        case 2: remoteShellOn = !remoteShellOn; break; // TCP shell (plaintext, :23)
+        case 3:  // User
           openText("SSH user", sshUser, "login name for ssh", false, MODE_SETTINGS,
-                   [](String v){ sshUser = v; saveCfg(); setPage = PG_SSH; selIdx = 2; });
+                   [](String v){ sshUser = v; saveCfg(); setPage = PG_SSH; selIdx = 3; });
           return;
-        case 3:  // Password (cleartext, per request)
+        case 4:  // Password (cleartext, per request)
           openText("SSH password", sshPass, "login password for ssh", false, MODE_SETTINGS,
-                   [](String v){ sshPass = v; saveCfg(); setPage = PG_SSH; selIdx = 3; });
+                   [](String v){ sshPass = v; saveCfg(); setPage = PG_SSH; selIdx = 4; });
           return;
-        // case 4 Connect: read-only helper text
-        case 5: sshRegenHostKey(); setMsg = "new host key (clients must re-accept)"; break;
+        // case 5 Connect: read-only helper text
+        case 6: sshRegenHostKey(); setMsg = "new host key (clients must re-accept)"; break;
       }
       break;
   }
