@@ -14,8 +14,17 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <TinyGPSPlus.h>
 #include "secrets.h"
 #include "version.h"
+
+// T-Deck Plus pins (from HARDWARE.md / LILYGO repo)
+#define PIN_BAT_ADC   4
+#define PIN_GPS_RX    44   // ESP RX <- GPS TX
+#define PIN_GPS_TX    43   // ESP TX -> GPS RX
+
+static TinyGPSPlus gps;
+static bool gpsStarted = false;
 
 #ifndef DEFAULT_WIFI_SSID
 #define DEFAULT_WIFI_SSID ""
@@ -79,7 +88,22 @@ static void handleCommand(const String& lineIn, Print& out) {
   String line = lineIn; line.trim();
   if (line.isEmpty()) return;
   if (line == "help") {
-    out.println("commands: ask <text> | claude <text> | wifi | scan | ip | status | help");
+    out.println("commands: ask <text> | claude <text> | wifi | scan | bat | gps | ip | status | help");
+  } else if (line == "bat") {
+    int mv = analogReadMilliVolts(PIN_BAT_ADC);
+    float v = mv / 1000.0f * 2.0f;  // T-Deck uses a 2:1 divider on the battery ADC
+    int pct = (int)((v - 3.3f) / (4.2f - 3.3f) * 100.0f);
+    pct = pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+    out.printf("battery: %.2f V  (~%d%%)  [adc raw %d mV]\n", v, pct, mv);
+  } else if (line == "gps") {
+    out.printf("gps: chars=%lu sentences=%lu fixes=%lu  sats=%d  valid=%d\n",
+               gps.charsProcessed(), gps.sentencesWithFix(), gps.passedChecksum(),
+               gps.satellites.value(), gps.location.isValid());
+    if (gps.location.isValid())
+      out.printf("  lat=%.6f lon=%.6f alt=%.1fm speed=%.1fkmh\n",
+                 gps.location.lat(), gps.location.lng(), gps.altitude.meters(), gps.speed.kmph());
+    else
+      out.println("  no fix yet (needs sky view; UART active if chars>0)");
   } else if (line == "ip" || line == "status") {
     out.printf("RoostOS Comm %s (smoke)\n", ROOST_COMM_VERSION);
     out.printf("compiled SSID='%s' (passlen=%d)\n", DEFAULT_WIFI_SSID, (int)strlen(DEFAULT_WIFI_PASS));
@@ -167,12 +191,17 @@ void setup() {
   connectWifi();
   tcpServer.begin();
   Serial.println("[tcp] shell on port 23 (nc <ip> 23)");
+  Serial1.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);  // L76K GPS
+  gpsStarted = true;
+  Serial.println("[gps] UART started @9600 (RX44/TX43)");
   Serial.println("type: help");
 }
 
 static String serialBuf, tcpBuf;
 
 void loop() {
+  // Feed GPS UART bytes to the parser
+  if (gpsStarted) while (Serial1.available()) gps.encode(Serial1.read());
   // Serial line assembly
   while (Serial.available()) {
     char c = Serial.read();
