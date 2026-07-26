@@ -12,8 +12,11 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include <TJpg_Decoder.h>
+#include <TinyGPSPlus.h>
 #include <Preferences.h>
 #include <vector>
+#include <functional>
 #include "secrets.h"
 #include "version.h"
 
@@ -48,6 +51,12 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 #ifndef DEFAULT_AI_PROVIDER
 #define DEFAULT_AI_PROVIDER "anthropic"
 #endif
+#ifndef GEOAPIFY_KEY
+#define GEOAPIFY_KEY ""
+#endif
+#ifndef ANTHROPIC_API_KEY
+#define ANTHROPIC_API_KEY ""
+#endif
 
 static const char* SYS_PROMPT =
   "You are RoostOS, a friendly assistant on a small handheld device with a tiny "
@@ -62,12 +71,20 @@ static String defaultModel(const String& p) {
   if (p == "ollama") return "llama3.2";
   return "claude-haiku-4-5";
 }
-// A provider is selectable only if its key/host is configured (in secrets.h).
+
+// API keys/host: default from secrets.h but RUNTIME-OVERRIDABLE (paste over SSH /
+// serial, stored in NVS) so anyone can flash with only WiFi and configure later.
+static String  kAnthropic = ANTHROPIC_API_KEY;
+static String  kOpenAI    = OPENAI_API_KEY;
+static String  kGemini    = GEMINI_API_KEY;
+static String  ollamaHost = OLLAMA_HOST;
+
+// A provider is selectable only if its key/host is configured.
 static bool providerConfigured(const String& p) {
-  if (p == "anthropic") return strlen(ANTHROPIC_API_KEY) > 0;
-  if (p == "openai")    return strlen(OPENAI_API_KEY) > 0;
-  if (p == "gemini")    return strlen(GEMINI_API_KEY) > 0;
-  if (p == "ollama")    return strlen(OLLAMA_HOST) > 0;
+  if (p == "anthropic") return kAnthropic.length() > 0;
+  if (p == "openai")    return kOpenAI.length() > 0;
+  if (p == "gemini")    return kGemini.length() > 0;
+  if (p == "ollama")    return ollamaHost.length() > 0;
   return false;
 }
 
@@ -97,6 +114,37 @@ static int scrollStep = 2;     // lines per trackball detent (adjustable "rate")
 static String aiProvider = DEFAULT_AI_PROVIDER;   // anthropic|openai|gemini|ollama
 static String aiModel = "";                        // set from NVS / provider default
 
+// ---- device / personalization / feature config (all persisted) ----
+static String  userName   = "";                    // AI addresses the user by this
+static int     tzOffsetMin = 0;                    // minutes from UTC (e.g. -300 = EST)
+static int     brightness = 230;                   // 0..255 backlight (LEDC PWM on BL)
+static bool    soundsOn   = true;                  // UI/alert tones (speaker)
+static bool    trackballOn = true;                 // false hides the cursor/roll nav
+static bool    webSearchOn = false;                // allow AI web search (roadmap)
+static bool    remoteShellOn = false;              // TCP shell on port 23
+static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
+// WiFi override set on-device (empty => fall back to secrets.h DEFAULT_WIFI_*)
+static String  wifiSsid = "", wifiPass = "";
+// last-known location (from GPS or a manual/AI set); used by the map screen
+static double  locLat = 0, locLon = 0; static bool locValid = false;
+// AI-requested map (set when the model calls the show_map tool; rendered after reply)
+static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
+static TinyGPSPlus gps;
+static HardwareSerial GPSser(1);
+// TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
+static bool jpgToTft(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bmp) {
+  if (y >= tft.height()) return 0;
+  tft.pushImage(x, y, w, h, bmp);
+  return 1;
+}
+
+static void applyBrightness() {
+  // LEDC PWM on the backlight pin (Arduino-ESP32 2.x API)
+  static bool init = false;
+  if (!init) { ledcSetup(0, 5000, 8); ledcAttachPin(PIN_BL, 0); init = true; }
+  ledcWrite(0, constrain(brightness, 8, 255));
+}
+
 static void saveCfg() {
   prefs.begin("roostcomm", false);
   prefs.putInt("chatFont", chatFontIdx);
@@ -107,6 +155,20 @@ static void saveCfg() {
   prefs.putInt("scrollStep", scrollStep);
   prefs.putString("aiProv", aiProvider);
   prefs.putString("aiModel", aiModel);
+  prefs.putString("userName", userName);
+  prefs.putInt("tzOff", tzOffsetMin);
+  prefs.putInt("bright", brightness);
+  prefs.putBool("sounds", soundsOn);
+  prefs.putBool("tball", trackballOn);
+  prefs.putBool("websrch", webSearchOn);
+  prefs.putBool("rshell", remoteShellOn);
+  prefs.putString("mapKey", mapKey);
+  prefs.putString("wSsid", wifiSsid);
+  prefs.putString("wPass", wifiPass);
+  prefs.putString("kAnth", kAnthropic);
+  prefs.putString("kOai", kOpenAI);
+  prefs.putString("kGem", kGemini);
+  prefs.putString("olHost", ollamaHost);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -119,6 +181,20 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   scrollStep   = prefs.getInt("scrollStep", scrollStep);
   aiProvider   = prefs.getString("aiProv", aiProvider);
   aiModel      = prefs.getString("aiModel", defaultModel(aiProvider));
+  userName     = prefs.getString("userName", userName);
+  tzOffsetMin  = prefs.getInt("tzOff", tzOffsetMin);
+  brightness   = prefs.getInt("bright", brightness);
+  soundsOn     = prefs.getBool("sounds", soundsOn);
+  trackballOn  = prefs.getBool("tball", trackballOn);
+  webSearchOn  = prefs.getBool("websrch", webSearchOn);
+  remoteShellOn = prefs.getBool("rshell", remoteShellOn);
+  mapKey       = prefs.getString("mapKey", mapKey);
+  wifiSsid     = prefs.getString("wSsid", wifiSsid);
+  wifiPass     = prefs.getString("wPass", wifiPass);
+  kAnthropic   = prefs.getString("kAnth", kAnthropic);
+  kOpenAI      = prefs.getString("kOai", kOpenAI);
+  kGemini      = prefs.getString("kGem", kGemini);
+  ollamaHost   = prefs.getString("olHost", ollamaHost);
   prefs.end();
 }
 
@@ -137,13 +213,13 @@ static uint16_t namedColor(const String& n) {
   return 0xFFFF;  // 0xFFFF = "unknown"
 }
 
-// ---- settings screen ----
-enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT };
+// ---- screen modes ----
+enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT, MODE_TEXT, MODE_WIFI, MODE_MAP, MODE_GAME };
 static int uiMode = MODE_CHAT;
 static int selIdx = 0;
 // Settings are organized as a main page with per-category sub-pages (BlackBerry
 // style: <=6 options each, item 0 is always Back). selIdx indexes the current page.
-enum { PG_MAIN, PG_DISPLAY, PG_COLORS, PG_AI, PG_SYSTEM, PG_COUNT };
+enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_COUNT };
 static int setPage = PG_MAIN;
 static String setMsg = "";   // transient status line (e.g. provider switch result)
 static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
@@ -256,6 +332,11 @@ static void draw() {
 static bool switchProvider(const String& p, String& msg);
 static bool providerConfigured(const String& p);
 static String defaultModel(const String& p);
+static bool joinWifi(const String& ssid, const String& pass);
+static String activeSsid();
+static void draw();
+static void showMap(double lat, double lon, int zoom);
+static void gameLaunch(int which);
 
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
@@ -264,10 +345,28 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
   switch (pg) {
     case PG_MAIN:
       row("Back to chat", "");
+      row("Apps", ">");
       row("Display", ">"); row("Colors", ">");
       row("AI Provider", aiProvider);
+      row("Device", ">");
       row("System / About", ">");
       return "Settings";
+    case PG_APPS:
+      row("< Back", "");
+      row("Map", locValid ? "gps" : "no fix");
+      row("Snake", ">");
+      row("Sudoku", ">");
+      row("GPS status", locValid ? String(locLat, 3) + "," + String(locLon, 3) : String("no fix"));
+      return "Apps";
+    case PG_DEVICE:
+      row("< Back", "");
+      row("Your name", userName.length() ? userName : String("(set)"));
+      row("Timezone", (tzOffsetMin >= 0 ? "+" : "-") + String(abs(tzOffsetMin) / 60) + "h");
+      row("Brightness", String((brightness * 100) / 255) + "%");
+      row("Sounds", soundsOn ? "on" : "off");
+      row("Trackball", trackballOn ? "on" : "off");
+      row("Web search", webSearchOn ? "on" : "off");
+      return "Device";
     case PG_DISPLAY:
       row("< Back", "");
       row("Chat font",  FONTS[chatFontIdx].name);
@@ -294,7 +393,9 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
     case PG_SYSTEM:
       row("< Back", "");
       row("About", ">");
-      row("WiFi", WiFi.isConnected() ? WiFi.SSID() : String("down"));
+      row("WiFi setup", WiFi.isConnected() ? WiFi.SSID() : String("down"));
+      row("Remote shell", remoteShellOn ? "on :23" : "off");
+      row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
       return "System";
@@ -377,15 +478,52 @@ static String nextModel(const String& p, const String& cur) {
   return String(L[(idx + 1) % n]);
 }
 
+// ---- generic on-screen text entry (keyboard) ----
+// Used for name, WiFi password, map key, map destination. Enter commits (calls
+// the callback), Esc (27) cancels. Optional masking hides the value (passwords).
+static String textTitle, textVal, textHint;
+static bool   textMask = false;
+static std::function<void(String)> textCb;
+static int    textReturnMode = MODE_SETTINGS;
+
+static void drawText() {
+  tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
+  tft.setTextColor(C_INK, C_PANEL);  tft.drawString(" " + textTitle, 4 + tft.textWidth("RoostOS"), 4);
+  setFont(1);
+  int y = headerH + 18;
+  tft.setTextColor(C_DIM, C_BG); tft.drawString(textHint.length() ? textHint : String("type, then Enter"), 8, y);
+  y += tft.fontHeight() + 12;
+  String shown = textVal;
+  if (textMask) { shown = ""; for (size_t i = 0; i < textVal.length(); i++) shown += '*'; }
+  tft.fillRect(6, y - 2, scrW - 12, tft.fontHeight() + 8, C_PANEL);
+  tft.setTextColor(C_AMBER, C_PANEL); tft.drawString("> ", 10, y + 2);
+  int pw = tft.textWidth("> ");
+  tft.setTextColor(C_INK, C_PANEL);
+  while (shown.length() && tft.textWidth(shown) > scrW - 30 - pw) shown = shown.substring(1);
+  tft.drawString(shown + "_", 10 + pw, y + 2);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("Enter = save    Esc = cancel", 4, scrH - 12);
+}
+static void openText(const String& title, const String& initial, const String& hint,
+                     bool mask, int returnMode, std::function<void(String)> cb) {
+  textTitle = title; textVal = initial; textHint = hint; textMask = mask;
+  textReturnMode = returnMode; textCb = cb; uiMode = MODE_TEXT; drawText();
+}
+
 static void activateSetting() {
   setMsg = "";
   if (setPage == PG_MAIN) {
     switch (selIdx) {
       case 0: uiMode = MODE_CHAT; draw(); return;         // Back to chat
-      case 1: setPage = PG_DISPLAY; selIdx = 0; break;
-      case 2: setPage = PG_COLORS;  selIdx = 0; break;
-      case 3: setPage = PG_AI;      selIdx = 0; break;
-      case 4: setPage = PG_SYSTEM;  selIdx = 0; break;
+      case 1: setPage = PG_APPS;    selIdx = 0; break;
+      case 2: setPage = PG_DISPLAY; selIdx = 0; break;
+      case 3: setPage = PG_COLORS;  selIdx = 0; break;
+      case 4: setPage = PG_AI;      selIdx = 0; break;
+      case 5: setPage = PG_DEVICE;  selIdx = 0; break;
+      case 6: setPage = PG_SYSTEM;  selIdx = 0; break;
     }
     drawSettings(); return;
   }
@@ -393,6 +531,15 @@ static void activateSetting() {
   if (selIdx == 0) { setPage = PG_MAIN; selIdx = 0; drawSettings(); return; }
 
   switch (setPage) {
+    case PG_APPS:
+      switch (selIdx) {
+        case 1: if (locValid) { showMap(locLat, locLon, 14); return; }
+                setMsg = "no GPS fix; use /map <lat> <lon>"; break;
+        case 2: gameLaunch(0); return;   // Snake
+        case 3: gameLaunch(1); return;   // Sudoku
+        case 4: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
+      }
+      break;
     case PG_DISPLAY:
       switch (selIdx) {
         case 1: chatFontIdx  = (chatFontIdx + 1) % NFONTS; break;
@@ -419,9 +566,42 @@ static void activateSetting() {
       }
       break;
     }
+    case PG_DEVICE:
+      switch (selIdx) {
+        case 1:  // Your name -> text entry
+          openText("Your name", userName, "so the AI can greet you", false, MODE_SETTINGS,
+                   [](String v){ userName = v; saveCfg(); });
+          return;
+        case 2: { // Timezone: cycle -12h..+14h in 1h steps
+          tzOffsetMin += 60; if (tzOffsetMin > 14 * 60) tzOffsetMin = -12 * 60; break; }
+        case 3: { // Brightness: 20/40/60/80/100%
+          int pct = (brightness * 100) / 255; pct += 20; if (pct > 100) pct = 20;
+          brightness = (pct * 255) / 100; applyBrightness(); break; }
+        case 4: soundsOn    = !soundsOn;    break;
+        case 5: trackballOn = !trackballOn; break;
+        case 6: webSearchOn = !webSearchOn; break;
+      }
+      break;
     case PG_SYSTEM:
-      if (selIdx == 1) { uiMode = MODE_ABOUT; drawAbout(); return; }   // About
-      // WiFi/IP/Uptime rows are read-only status
+      switch (selIdx) {
+        case 1: uiMode = MODE_ABOUT; drawAbout(); return;               // About
+        case 2:  // WiFi setup: type SSID, then password, then join
+          openText("WiFi network", activeSsid(), "enter the 2.4GHz SSID", false, MODE_SETTINGS,
+            [](String ssid){
+              openText("WiFi password", "", "for '" + ssid + "'", true, MODE_SETTINGS,
+                [ssid](String pass){
+                  setMsg = joinWifi(ssid, pass) ? "joined " + ssid : "join failed: " + ssid;
+                  setPage = PG_SYSTEM; selIdx = 2;
+                });
+            });
+          return;
+        case 3: remoteShellOn = !remoteShellOn; break;                  // Remote shell toggle
+        case 4:  // Map key entry
+          openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 4; });
+          return;
+        // IP / Uptime rows are read-only status
+      }
       break;
   }
   saveCfg(); drawSettings();
@@ -448,33 +628,84 @@ static String httpPostJSON(bool secure, const String& url, const String& body,
   return payload;   // caller inspects for API-level errors
 }
 
+// Build the system prompt, personalized with the user's name and (if NTP-synced)
+// the current local time so the AI is time-aware.
+static String buildSysPrompt() {
+  String s = SYS_PROMPT;
+  if (userName.length()) s += " The user's name is " + userName + "; address them by name.";
+  time_t nowt = time(nullptr);
+  if (nowt > 1700000000) {                 // NTP has set the clock
+    nowt += (time_t)tzOffsetMin * 60;
+    struct tm tmv; gmtime_r(&nowt, &tmv);
+    char buf[40]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tmv);
+    s += " Current local date/time: "; s += buf; s += ".";
+  }
+  return s;
+}
+
 // Ask the currently-selected AI provider. Returns reply text (or an "[error] ..." string).
 static String askAI(const String& prompt) {
   if (WiFi.status() != WL_CONNECTED) return "[error] WiFi not connected";
-  String err, p;
+  String err, p, sp = buildSysPrompt();
   JsonDocument r;
 
   if (aiProvider == "anthropic") {
-    if (!strlen(ANTHROPIC_API_KEY)) return "[no Anthropic key — set in secrets.h]";
-    JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 400; req["system"] = SYS_PROMPT;
-    JsonObject m = req["messages"].to<JsonArray>().add<JsonObject>(); m["role"] = "user"; m["content"] = prompt;
-    String body; serializeJson(req, body);
-    p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
-                     "x-api-key", ANTHROPIC_API_KEY, "anthropic-version", "2023-06-01", err);
-    if (p == "") return "[error] " + err;
-    if (deserializeJson(r, p)) return "[bad JSON]";
-    if (r["type"] == "error") return String("[api] ") + (const char*)(r["error"]["message"] | "");
-    String t; for (JsonObject b : r["content"].as<JsonArray>()) if (b["type"] == "text") t += (const char*)(b["text"] | "");
-    return t.length() ? t : "[no text]";
+    if (!kAnthropic.length()) return "[no Anthropic key — set via /key anthropic <key>]";
+    JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 500; req["system"] = sp;
+    JsonArray msgs_ = req["messages"].to<JsonArray>();
+    { JsonObject m = msgs_.add<JsonObject>(); m["role"] = "user"; m["content"] = prompt; }
+    // tools: the model can show a map (using its own knowledge of coordinates) or read GPS
+    JsonArray tools = req["tools"].to<JsonArray>();
+    { JsonObject t = tools.add<JsonObject>();
+      t["name"] = "show_map"; t["description"] = "Display a map on the device screen centered at a latitude/longitude. Use your own knowledge of place coordinates.";
+      JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
+      JsonObject pr = sc["properties"].to<JsonObject>();
+      pr["lat"]["type"] = "number"; pr["lon"]["type"] = "number";
+      JsonArray rq = sc["required"].to<JsonArray>(); rq.add("lat"); rq.add("lon"); }
+    { JsonObject t = tools.add<JsonObject>();
+      t["name"] = "get_location"; t["description"] = "Get the device's current GPS latitude/longitude.";
+      JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object"; sc["properties"].to<JsonObject>(); }
+    for (int round = 0; round < 3; round++) {
+      String body; serializeJson(req, body);
+      p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
+                       "x-api-key", kAnthropic.c_str(), "anthropic-version", "2023-06-01", err);
+      if (p == "") return "[error] " + err;
+      if (deserializeJson(r, p)) return "[bad JSON]";
+      if (r["type"] == "error") return String("[api] ") + (const char*)(r["error"]["message"] | "");
+      String text;
+      JsonObject asst = msgs_.add<JsonObject>(); asst["role"] = "assistant";
+      JsonArray ac = asst["content"].to<JsonArray>();
+      std::vector<String> tuId, tuRes;
+      for (JsonObject b : r["content"].as<JsonArray>()) {
+        String type = (const char*)(b["type"] | "");
+        JsonObject cc = ac.add<JsonObject>();
+        if (type == "text") { cc["type"] = "text"; cc["text"] = (const char*)(b["text"] | ""); text += (const char*)(b["text"] | ""); }
+        else if (type == "tool_use") {
+          cc["type"] = "tool_use"; cc["id"] = (const char*)b["id"]; cc["name"] = (const char*)b["name"]; cc["input"] = b["input"];
+          String name = (const char*)(b["name"] | ""), res;
+          if (name == "show_map") { pMapLat = b["input"]["lat"] | 0.0; pMapLon = b["input"]["lon"] | 0.0; pendingMap = true; res = "map displayed on device"; }
+          else if (name == "get_location") { res = locValid ? String(locLat, 5) + "," + String(locLon, 5) : "no GPS fix"; }
+          else res = "unknown tool";
+          tuId.push_back((const char*)(b["id"] | "")); tuRes.push_back(res);
+        }
+      }
+      if (tuId.empty()) return text.length() ? text : "[no text]";   // done, no tool call
+      JsonObject ur = msgs_.add<JsonObject>(); ur["role"] = "user";
+      JsonArray urc = ur["content"].to<JsonArray>();
+      for (size_t i = 0; i < tuId.size(); i++) {
+        JsonObject tr = urc.add<JsonObject>(); tr["type"] = "tool_result"; tr["tool_use_id"] = tuId[i]; tr["content"] = tuRes[i];
+      }
+    }
+    return "[tool loop limit]";
   }
   if (aiProvider == "openai") {
-    if (!strlen(OPENAI_API_KEY)) return "[no OpenAI key — set in secrets.h]";
+    if (!kOpenAI.length()) return "[no OpenAI key — set via /key openai <key>]";
     JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 400;
     JsonArray a = req["messages"].to<JsonArray>();
-    JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = SYS_PROMPT;
+    JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = sp;
     JsonObject u = a.add<JsonObject>(); u["role"] = "user"; u["content"] = prompt;
     String body; serializeJson(req, body);
-    String auth = String("Bearer ") + OPENAI_API_KEY;
+    String auth = String("Bearer ") + kOpenAI;
     p = httpPostJSON(true, "https://api.openai.com/v1/chat/completions", body,
                      "authorization", auth.c_str(), nullptr, nullptr, err);
     if (p == "") return "[error] " + err;
@@ -483,15 +714,15 @@ static String askAI(const String& prompt) {
     return String((const char*)(r["choices"][0]["message"]["content"] | "[no text]"));
   }
   if (aiProvider == "gemini") {
-    if (!strlen(GEMINI_API_KEY)) return "[no Gemini key — set in secrets.h]";
+    if (!kGemini.length()) return "[no Gemini key — set via /key gemini <key>]";
     JsonDocument req;
-    req["systemInstruction"]["parts"][0]["text"] = SYS_PROMPT;
+    req["systemInstruction"]["parts"][0]["text"] = sp;
     JsonObject u = req["contents"].to<JsonArray>().add<JsonObject>();
     u["role"] = "user"; u["parts"][0]["text"] = prompt;
     req["generationConfig"]["maxOutputTokens"] = 400;
     String body; serializeJson(req, body);
     String url = String("https://generativelanguage.googleapis.com/v1beta/models/") +
-                 aiModel + ":generateContent?key=" + GEMINI_API_KEY;
+                 aiModel + ":generateContent?key=" + kGemini;
     p = httpPostJSON(true, url, body, nullptr, nullptr, nullptr, nullptr, err);
     if (p == "") return "[error] " + err;
     if (deserializeJson(r, p)) return "[bad JSON]";
@@ -499,13 +730,13 @@ static String askAI(const String& prompt) {
     return String((const char*)(r["candidates"][0]["content"]["parts"][0]["text"] | "[no text]"));
   }
   if (aiProvider == "ollama") {
-    if (!strlen(OLLAMA_HOST)) return "[set Ollama host in secrets.h]";
+    if (!ollamaHost.length()) return "[set Ollama host via /ollama <host:port>]";
     JsonDocument req; req["model"] = aiModel; req["stream"] = false;
     JsonArray a = req["messages"].to<JsonArray>();
-    JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = SYS_PROMPT;
+    JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = sp;
     JsonObject u = a.add<JsonObject>(); u["role"] = "user"; u["content"] = prompt;
     String body; serializeJson(req, body);
-    p = httpPostJSON(false, String("http://") + OLLAMA_HOST + "/api/chat", body,
+    p = httpPostJSON(false, String("http://") + ollamaHost + "/api/chat", body,
                      nullptr, nullptr, nullptr, nullptr, err);
     if (p == "") return "[error] " + err;
     if (deserializeJson(r, p)) return "[bad JSON]";
@@ -537,6 +768,7 @@ static void sendPrompt(const String& prompt) {
   wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
+  if (pendingMap) { pendingMap = false; showMap(pMapLat, pMapLon, 13); }   // AI asked for a map
 }
 
 static uint8_t readKey() {
@@ -576,12 +808,29 @@ static bool gtReadRaw(int& rx, int& ry) {
 // Map raw touch -> screen coords for TFT rotation 1. FIRST GUESS — calibrated from serial logs.
 static void gtMap(int rx, int ry, int& sx, int& sy) { sx = rx; sy = ry; }
 
+// Active credentials: on-device override (Settings) wins over secrets.h defaults.
+static String activeSsid() { return wifiSsid.length() ? wifiSsid : String(DEFAULT_WIFI_SSID); }
+static String activePass() { return wifiSsid.length() ? wifiPass : String(DEFAULT_WIFI_PASS); }
+
 static void connectWifi() {
-  if (String(DEFAULT_WIFI_SSID).isEmpty()) return;
+  String ssid = activeSsid();
+  if (ssid.isEmpty()) return;
   WiFi.mode(WIFI_STA);
-  WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+  WiFi.setSleep(false);   // disable modem sleep so inbound TCP (the shell) is reliable
+  WiFi.begin(ssid.c_str(), activePass().c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(200);
+}
+
+// Save + (re)connect to a network entered on-device. Returns true if associated.
+static bool joinWifi(const String& ssid, const String& pass) {
+  wifiSsid = ssid; wifiPass = pass; saveCfg();
+  WiFi.disconnect(); WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(200);
+  return WiFi.status() == WL_CONNECTED;
 }
 
 // Branded boot splash: RoostOS wordmark + a little chick perched on an antenna.
@@ -615,6 +864,8 @@ void setup() {
   Serial.printf("\n=== RoostOS Communicator APP %s ===\n", ROOST_COMM_VERSION);
   Wire.begin(I2C_SDA, I2C_SCL);
   gtProbe();   // detect GT911 touch controller
+  GPSser.begin(9600, SERIAL_8N1, 43, 44);   // L76K GPS on UART1
+  TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(jpgToTft);
 
   tft.init(); tft.setRotation(1);
   scrW = tft.width(); scrH = tft.height();
@@ -627,6 +878,7 @@ void setup() {
   C_AMBER  = tft.color565(0xff, 0xbe, 0x4d);
   userColor = C_INDIGO; aiColor = C_TEAL;   // defaults
   loadCfg();                                 // override from saved settings (NVS)
+  applyBrightness();                         // LEDC PWM backlight at saved level
 
   drawSplash();
   delay(splashMs);   // adjustable in settings
@@ -638,6 +890,8 @@ void setup() {
     ? String("Ready to Roost! Type a message + Enter, or tap the menu.")
     : String("WiFi failed - check SSS-FAMILY"), C_TEAL);
   chatFontIdx = save;                         // swap to preferred size
+  if (WiFi.status() == WL_CONNECTED)
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // UTC; tz applied in buildSysPrompt
   draw();
   Serial.printf("[wifi] status=%d ip=%s\n", (int)WiFi.status(), WiFi.localIP().toString().c_str());
   Serial.println("cmds: ask <t> | font <n> | inputfont <n> | color user|ai <name> | ip");
@@ -656,10 +910,10 @@ static int fontArgToIdx(const String& arg, int cur) {
 
 // Is the Ollama host answering? (quick GET /api/tags with short timeouts)
 static bool ollamaReachable() {
-  if (!strlen(OLLAMA_HOST)) return false;
+  if (!ollamaHost.length()) return false;
   WiFiClient c; HTTPClient h;
   h.setConnectTimeout(3000); h.setTimeout(4000);
-  if (!h.begin(c, String("http://") + OLLAMA_HOST + "/api/tags")) return false;
+  if (!h.begin(c, String("http://") + ollamaHost + "/api/tags")) return false;
   int code = h.GET(); h.end();
   return code == 200;
 }
@@ -670,7 +924,7 @@ static bool switchProvider(const String& p, String& msg) {
   if (!valid) { msg = "unknown provider"; return false; }
   if (!providerConfigured(p)) { msg = "no key for " + p; return false; }
   if (p == "ollama" && WiFi.status() == WL_CONNECTED && !ollamaReachable()) {
-    msg = "ollama unreachable @ " + String(OLLAMA_HOST); return false;
+    msg = "ollama unreachable @ " + ollamaHost; return false;
   }
   aiProvider = p; aiModel = defaultModel(p); saveCfg();
   msg = "provider: " + aiProvider + " / " + aiModel; return true;
@@ -708,12 +962,349 @@ static String applyCfgCmd(String s) {
     String m; switchProvider(v, m); return m;
   }
   if (cmdIs(tok, "model")) { if (rest.length()) { aiModel = rest; saveCfg(); } return String("model: ") + aiModel; }
+  // --- device / personalization ---
+  if (cmdIs(tok, "name")) { userName = rest; saveCfg(); return String("name: ") + (userName.length() ? userName : "(cleared)"); }
+  if (cmdIs(tok, "tz") || cmdIs(tok, "timezone")) {
+    if (rest.length()) { tzOffsetMin = constrain((int)(rest.toFloat() * 60), -12 * 60, 14 * 60); saveCfg(); }
+    return String("timezone: UTC") + (tzOffsetMin >= 0 ? "+" : "") + String(tzOffsetMin / 60.0, 1) + "h";
+  }
+  if (cmdIs(tok, "brightness")) { if (rest.length()) { brightness = constrain((rest.toInt() * 255) / 100, 8, 255); applyBrightness(); saveCfg(); } return String("brightness: ") + String((brightness * 100) / 255) + "%"; }
+  if (cmdIs(tok, "sounds")) { soundsOn = (rest != "off" && rest != "0"); saveCfg(); return String("sounds: ") + (soundsOn ? "on" : "off"); }
+  if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
+  if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
+  if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
+  if (tok == "gps") {
+    if (locValid) return "gps: " + String(locLat, 5) + "," + String(locLon, 5) + "  sats:" + String(gps.satellites.value());
+    return "gps: no fix yet (sats:" + String(gps.satellites.value()) + ")";
+  }
+  if (tok == "map") {        // exact-match (so it doesn't collide with 'mapkey')
+    double la = locLat, lo = locLon;
+    if (rest.length()) { int q = rest.indexOf(' '); if (q > 0) { la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); } }
+    else if (!locValid) return "no GPS fix yet - try: map <lat> <lon>";
+    showMap(la, lo, 14); return "map";
+  }
+  if (tok == "game") { String g = rest; g.toLowerCase();
+    if (g.startsWith("sn")) { gameLaunch(0); return "snake"; }
+    if (g.startsWith("su")) { gameLaunch(1); return "sudoku"; }
+    return "game: snake | sudoku"; }
+  if (tok == "snake")  { gameLaunch(0); return "snake"; }
+  if (tok == "sudoku") { gameLaunch(1); return "sudoku"; }
+  if (cmdIs(tok, "mapkey")) { if (rest.length()) { mapKey = rest; saveCfg(); } return String("map key: ") + (mapKey.length() ? "set" : "none"); }
+  if (cmdIs(tok, "key")) {   // /key anthropic|openai|gemini <api-key>
+    int p = rest.indexOf(' ');
+    if (p < 0) return "usage: key <anthropic|openai|gemini> <api-key>";
+    String which = rest.substring(0, p); which.toLowerCase();
+    String val = rest.substring(p + 1); val.trim();
+    if      (which.startsWith("a")) kAnthropic = val;
+    else if (which.startsWith("o")) kOpenAI = val;
+    else if (which.startsWith("g")) kGemini = val;
+    else return "provider: anthropic|openai|gemini";
+    saveCfg();
+    return which + " key: " + (val.length() ? "set (" + String(val.length()) + " chars)" : "cleared");
+  }
+  if (cmdIs(tok, "ollama")) { if (rest.length()) { ollamaHost = rest; saveCfg(); } return String("ollama host: ") + (ollamaHost.length() ? ollamaHost : "none"); }
+  if (cmdIs(tok, "wifi")) {
+    int p = rest.indexOf(' ');
+    if (p < 0) return "usage: wifi <ssid> <password>";
+    String ssid = rest.substring(0, p), pass = rest.substring(p + 1); pass.trim();
+    return joinWifi(ssid, pass) ? "joined " + ssid : "join failed: " + ssid;
+  }
   return "";
+}
+
+// ============================================================================
+//  GPS (L76K on UART1, pins RX=43 TX=44 @9600) + on-screen maps (Geoapify
+//  static JPEG rendered via TJpg_Decoder).
+// ============================================================================
+static void pollGps() {
+  while (GPSser.available()) gps.encode(GPSser.read());
+  if (gps.location.isValid() && gps.location.age() < 5000) {
+    locLat = gps.location.lat(); locLon = gps.location.lng(); locValid = true;
+  }
+}
+static void mapMsg(const String& m) {
+  tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.setTextColor(C_INK, C_BG); tft.drawString(m, 8, 70);
+  tft.setTextColor(C_DIM, C_BG); tft.drawString("any key = back to chat", 8, scrH - 12);
+}
+static void showMap(double lat, double lon, int zoom) {
+  uiMode = MODE_MAP;
+  if (!mapKey.length())            { mapMsg("No map key. Set one:  /mapkey <key>"); return; }
+  if (WiFi.status() != WL_CONNECTED){ mapMsg("Map needs WiFi."); return; }
+  mapMsg("Loading map...");
+  char clat[16], clon[16]; dtostrf(lat, 0, 6, clat); dtostrf(lon, 0, 6, clon);
+  String url = String("https://maps.geoapify.com/v1/staticmap?style=osm-bright"
+                      "&width=320&height=224&center=lonlat:") + clon + "," + clat +
+               "&zoom=" + zoom + "&format=jpeg&marker=lonlat:" + clon + "," + clat +
+               ";color:%2334e2c0;size:medium&apiKey=" + mapKey;
+  WiFiClientSecure tls; tls.setInsecure();
+  HTTPClient http; http.setTimeout(15000);
+  if (!http.begin(tls, url)) { mapMsg("map: begin failed"); return; }
+  http.setUserAgent("RoostOS-Communicator");
+  int code = http.GET();
+  Serial.printf("[map] http=%d keylen=%d\n", code, (int)mapKey.length());   // key intentionally not logged
+  if (code != 200) {
+    String eb = http.getString(); http.end();
+    Serial.printf("[map] err body: %s\n", eb.substring(0, 160).c_str());
+    mapMsg("map http " + String(code) + " (see serial)"); return;
+  }
+  int len = http.getSize();
+  size_t cap = (len > 0) ? (size_t)len + 16 : 220000;
+  uint8_t* buf = (uint8_t*)ps_malloc(cap);
+  if (!buf) { http.end(); mapMsg("map: out of PSRAM"); return; }
+  WiFiClient* st = http.getStreamPtr(); size_t got = 0; uint32_t t0 = millis();
+  while (http.connected() && (len < 0 || got < (size_t)len) && got < cap && millis() - t0 < 15000) {
+    size_t avail = st->available();
+    if (avail) { int r = st->readBytes(buf + got, min(avail, cap - got)); if (r > 0) { got += r; t0 = millis(); } }
+    else delay(5);
+  }
+  http.end();
+  tft.fillScreen(C_BG);
+  TJpgDec.drawJpg(0, 8, buf, got);
+  free(buf);
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.setTextColor(C_AMBER); tft.setTextDatum(TL_DATUM);
+  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : " (set)"), 4, scrH - 11);
+}
+
+// ============================================================================
+//  Remote terminal shell (TCP :23) — "SSH-style" chat + config from a computer.
+//  `nc <device-ip> 23` (or telnet): just type to chat with the AI (shares the
+//  on-screen chat buffer), or use /help /set /get /quit. Gated by remoteShellOn.
+//  (Plain TCP now; real SSH via libssh_esp32 is the next transport step.)
+// ============================================================================
+static WiFiServer shellServer(23);
+static WiFiClient shellClient;
+static bool   shellStarted = false;
+static String shellBuf;
+static int    wizStep = -1;        // -1 = not in the /set wizard
+static bool   shellLastCR = false;
+
+static const char* WIZ_Q[] = {
+  "Your name (blank = skip): ",
+  "Timezone, hours from UTC e.g. -5 (blank = skip): ",
+  "Anthropic API key - paste sk-ant-... (blank = skip): ",
+  "OpenAI API key (blank = skip): ",
+  "Gemini API key (blank = skip): ",
+  "Ollama host host:port (blank = skip): ",
+  "AI provider [anthropic|openai|gemini|ollama] (blank = skip): ",
+  "Geoapify map key (blank = skip): ",
+  "Brightness %, 10-100 (blank = skip): ",
+  "WiFi as 'ssid password' (blank = skip): ",
+};
+static const char* WIZ_CMD[] = {
+  "name", "tz", "key anthropic", "key openai", "key gemini", "ollama",
+  "provider", "mapkey", "brightness", "wifi"
+};
+static const int WIZ_N = 10;
+
+// The shell can drive either the TCP client OR the USB-C serial console.
+static Print* shellOut = nullptr;
+static void shellPrint(const String& s) { if (shellOut) shellOut->print(s); }
+static void shellPrompt() { shellPrint("\r\nroost> "); }
+static void shellBanner() {
+  shellPrint(String("\r\n=== RoostOS Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
+  shellPrint("A handheld AI communicator. You're connected over the network.\r\n");
+  shellPrint("Just type to chat. Commands: /help  /set  /get  /quit\r\n");
+}
+static String shellConfigSummary() {
+  String s = "provider: " + aiProvider + " / " + aiModel + "\r\n";
+  s += "name: " + (userName.length() ? userName : String("(unset)")) + "\r\n";
+  s += "tz: UTC" + String(tzOffsetMin >= 0 ? "+" : "") + String(tzOffsetMin / 60.0, 1) + "h\r\n";
+  s += "wifi: " + (WiFi.isConnected() ? WiFi.SSID() : String("down")) + "  ip: " + WiFi.localIP().toString() + "\r\n";
+  s += "brightness: " + String((brightness * 100) / 255) + "%  sounds: " + (soundsOn ? "on" : "off") +
+       "  trackball: " + (trackballOn ? "on" : "off") + "\r\n";
+  s += "map key: " + String(mapKey.length() ? "set" : "none") + "  web search: " + (webSearchOn ? "on" : "off") + "\r\n";
+  return s;
+}
+static void handleShellLine(String line) {
+  line.trim();
+  // in the interactive setup wizard?
+  if (wizStep >= 0) {
+    if (line.length()) { String r = applyCfgCmd(String(WIZ_CMD[wizStep]) + " " + line); if (r.length()) shellPrint(r + "\r\n"); }
+    wizStep++;
+    if (wizStep < WIZ_N) { shellPrint(WIZ_Q[wizStep]); return; }
+    wizStep = -1; shellPrint("Setup complete.\r\n"); shellPrompt(); return;
+  }
+  if (line.length() == 0) { shellPrompt(); return; }
+  if (line == "/quit" || line == "/exit") { shellPrint("73s (bye)\r\n"); if (shellOut == (Print*)&shellClient) shellClient.stop(); return; }
+  if (line == "/help") {
+    shellPrint("Type anything to chat with the AI.\r\n"
+               "/set    interactive setup (name, timezone, provider, wifi...)\r\n"
+               "/get    show current config\r\n"
+               "/name <you> | /provider <p> | /model <m> | /wifi <ssid> <pass>\r\n"
+               "/brightness <10-100> | /tz <hrs> | /sounds on|off | /trackball on|off\r\n"
+               "/mapkey <key> | /ip | /quit\r\n");
+    shellPrompt(); return;
+  }
+  if (line == "/set")  { wizStep = 0; shellPrint("Interactive setup - blank answer skips.\r\n" + String(WIZ_Q[0])); return; }
+  if (line == "/get")  { shellPrint(shellConfigSummary()); shellPrompt(); return; }
+  if (line == "/ip")   { shellPrint("ip=" + WiFi.localIP().toString() + "\r\n"); shellPrompt(); return; }
+  if (line.startsWith("/")) {
+    String r = applyCfgCmd(line.substring(1));
+    shellPrint((r.length() ? r : String("unknown command (try /help)")) + "\r\n"); shellPrompt(); return;
+  }
+  // free text => chat (shared with the on-screen buffer)
+  addMsg("You (ssh): " + line, userColor);
+  if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
+  shellPrint("...\r\n");
+  String reply = askAI(line);
+  addMsg(aiLabel() + ": " + reply, aiColor);
+  if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
+  shellPrint(aiLabel() + ": " + reply + "\r\n");
+  if (pendingMap) { pendingMap = false; showMap(pMapLat, pMapLon, 13); shellPrint("(map shown on device)\r\n"); }
+  shellPrompt();
+}
+static void pollShell() {
+  if (!shellClient || !shellClient.connected()) {
+    WiFiClient c = shellServer.available();
+    if (c) { shellClient = c; shellBuf = ""; wizStep = -1; shellOut = (Print*)&shellClient; shellBanner(); shellPrompt(); }
+    return;
+  }
+  shellOut = (Print*)&shellClient;
+  while (shellClient.available()) {
+    char c = shellClient.read();
+    if (c == '\r' || c == '\n') {
+      if (c == '\n' && shellLastCR) { shellLastCR = false; continue; }  // swallow \n after \r
+      shellLastCR = (c == '\r');
+      String ln = shellBuf; shellBuf = ""; handleShellLine(ln);
+    } else { shellLastCR = false;
+      if (c == 8 || c == 127) { if (shellBuf.length()) shellBuf.remove(shellBuf.length() - 1); }
+      else if ((uint8_t)c >= 32 && (uint8_t)c < 127) shellBuf += c;
+    }
+  }
+}
+
+// ============================================================================
+//  Games: Snake (trackball/WASD) + Sudoku (QWERTY). MODE_GAME; Esc/q = back.
+// ============================================================================
+static int gGame = 0;               // 0 = snake, 1 = sudoku
+// --- Snake ---
+static const int CELL = 12;
+static int gCols, gRows;
+static std::vector<std::pair<int,int>> snake;
+static int sdx = 1, sdy = 0, ndx = 1, ndy = 0, gScore = 0;
+static bool gDead = false;
+static uint32_t gTickT = 0;
+static void placeFood(int& fx, int& fy) {
+  bool ok; do { ok = true; fx = random(gCols); fy = random(gRows);
+    for (auto& s : snake) if (s.first == fx && s.second == fy) ok = false;
+  } while (!ok);
+}
+static int gFoodX, gFoodY;
+static void snakeInit() {
+  gCols = scrW / CELL; gRows = (scrH - headerH) / CELL;
+  snake.clear(); snake.push_back({gCols / 2, gRows / 2});
+  sdx = ndx = 1; sdy = ndy = 0; gScore = 0; gDead = false;
+  placeFood(gFoodX, gFoodY); gTickT = millis();
+}
+static void snakeDraw() {
+  tft.fillScreen(C_BG);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Snake", 4, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 60, 4);
+  tft.setTextColor(C_DIM, C_PANEL); tft.drawString(gDead ? "DEAD - any key" : "ball/WASD  q=quit", scrW - 130, 4);
+  int oy = headerH;
+  tft.fillRect(gFoodX * CELL, oy + gFoodY * CELL, CELL - 1, CELL - 1, C_AMBER);
+  for (size_t i = 0; i < snake.size(); i++)
+    tft.fillRect(snake[i].first * CELL, oy + snake[i].second * CELL, CELL - 1, CELL - 1, i == 0 ? C_TEAL : C_INDIGO);
+}
+static void snakeStep() {
+  if (gDead) return;
+  sdx = ndx; sdy = ndy;
+  int hx = snake[0].first + sdx, hy = snake[0].second + sdy;
+  if (hx < 0 || hy < 0 || hx >= gCols || hy >= gRows) { gDead = true; snakeDraw(); return; }
+  for (auto& s : snake) if (s.first == hx && s.second == hy) { gDead = true; snakeDraw(); return; }
+  snake.insert(snake.begin(), {hx, hy});
+  if (hx == gFoodX && hy == gFoodY) { gScore++; placeFood(gFoodX, gFoodY); }
+  else snake.pop_back();
+  snakeDraw();
+}
+static void snakeTurn(int dx, int dy) {   // ignore 180-degree reversals
+  if (dx == -sdx && dy == -sdy) return;
+  ndx = dx; ndy = dy;
+}
+// --- Sudoku ---
+static const char* SU_PUZZLE =
+  "530070000600195000098000060800060003400803001700020006060000280000419005000080079";
+static int su[81], suGiven[81], suCur = 0;
+static void sudokuInit() {
+  for (int i = 0; i < 81; i++) { su[i] = SU_PUZZLE[i] - '0'; suGiven[i] = su[i] != 0; }
+  suCur = 0;
+}
+static bool sudokuWon() {
+  for (int i = 0; i < 81; i++) if (su[i] == 0) return false;
+  for (int r = 0; r < 9; r++) for (int a = 0; a < 9; a++) for (int b = a + 1; b < 9; b++) {
+    if (su[r*9+a] == su[r*9+b]) return false;      // row
+    if (su[a*9+r] == su[b*9+r]) return false;      // col
+  }
+  for (int br = 0; br < 9; br += 3) for (int bc = 0; bc < 9; bc += 3) {
+    int seen[10] = {0};
+    for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) { int v = su[(br+r)*9 + bc+c]; if (seen[v]++) return false; }
+  }
+  return true;
+}
+static void sudokuDraw() {
+  tft.fillScreen(C_BG);
+  tft.fillRect(0, 0, scrW, headerH, C_PANEL);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Sudoku", 4, 4);
+  bool won = sudokuWon();
+  tft.setTextColor(won ? C_TEAL : C_DIM, C_PANEL);
+  tft.drawString(won ? "SOLVED!  q=quit" : "1-9 set  WASD move  q=quit", scrW - 170, 4);
+  int G = 24, ox = (scrW - G * 9) / 2, oy = headerH + 4;
+  for (int i = 0; i < 81; i++) {
+    int r = i / 9, c = i % 9, x = ox + c * G, y = oy + r * G;
+    if (i == suCur) tft.fillRect(x, y, G, G, C_PANEL);
+    tft.drawRect(x, y, G, G, C_DIM);
+    if (su[i]) { tft.setFreeFont(&FreeSans12pt7b); tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(suGiven[i] ? C_INK : C_AMBER, i == suCur ? C_PANEL : C_BG);
+      tft.drawString(String(su[i]), x + G / 2, y + G / 2 + 1);
+      tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+    }
+  }
+  // thick 3x3 separators
+  for (int k = 0; k <= 9; k += 3) {
+    tft.drawFastVLine(ox + k * G, oy, G * 9, C_TEAL);
+    tft.drawFastHLine(ox, oy + k * G, G * 9, C_TEAL);
+  }
+}
+static void gameLaunch(int which) {
+  gGame = which; uiMode = MODE_GAME;
+  if (which == 0) { snakeInit(); snakeDraw(); } else { sudokuInit(); sudokuDraw(); }
+}
+static void gameKey(uint8_t k) {
+  if (k == 'q' || k == 27) { uiMode = MODE_CHAT; draw(); return; }
+  if (gGame == 0) {   // snake
+    if (gDead) { snakeInit(); snakeDraw(); return; }
+    if (k == 'w') snakeTurn(0, -1); else if (k == 's') snakeTurn(0, 1);
+    else if (k == 'a') snakeTurn(-1, 0); else if (k == 'd') snakeTurn(1, 0);
+  } else {            // sudoku
+    if (k == 'w' && suCur >= 9) suCur -= 9;
+    else if (k == 's' && suCur < 72) suCur += 9;
+    else if (k == 'a' && suCur % 9) suCur--;
+    else if (k == 'd' && suCur % 9 != 8) suCur++;
+    else if (k >= '1' && k <= '9') { if (!suGiven[suCur]) su[suCur] = k - '0'; }
+    else if (k == '0' || k == ' ' || k == 8 || k == 127) { if (!suGiven[suCur]) su[suCur] = 0; }
+    sudokuDraw();
+  }
+}
+static void gameTick() {   // snake auto-advance
+  if (gGame == 0 && !gDead && millis() - gTickT > 170) { gTickT = millis(); snakeStep(); }
 }
 
 void loop() {
   static bool clkPrev = true; static uint32_t clkT = 0, lastTouch = 0;
   uint32_t now = millis();
+
+  // remote shell lifecycle (start/stop with the Settings toggle)
+  if (remoteShellOn && WiFi.status() == WL_CONNECTED && !shellStarted) { shellServer.begin(); shellServer.setNoDelay(true); shellStarted = true; Serial.println("[shell] listening on :23"); }
+  else if ((!remoteShellOn || WiFi.status() != WL_CONNECTED) && shellStarted) { if (shellClient) shellClient.stop(); shellServer.end(); shellStarted = false; }
+  if (shellStarted) pollShell();
+  pollGps();
+  if (uiMode == MODE_GAME) gameTick();
 
   // trackball CLICK (GPIO0): chat -> open settings; settings -> activate selection
   bool clk = digitalRead(TB_CLICK);
@@ -721,21 +1312,30 @@ void loop() {
     clkT = now; Serial.println("[click]");
     if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
     else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
+    else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }
     else activateSetting();
   }
   clkPrev = clk;
 
-  // trackball ROLL up/down (scroll in chat; move selection in settings)
+  // trackball ROLL up/down (scroll in chat; move selection in settings) — gated by Settings toggle
   bool u = digitalRead(TB_UP), d = digitalRead(TB_DOWN);
-  if (uiMode == MODE_CHAT) {
-    int before = scrollLines;
-    if (!u && tbUpPrev && now - lastScroll > 90) { scrollLines += scrollStep; lastScroll = now; }
-    if (!d && tbDnPrev && now - lastScroll > 90) { scrollLines -= scrollStep; lastScroll = now; }
-    if (scrollLines < 0) scrollLines = 0;
-    if (scrollLines != before) draw();
-  } else if (uiMode == MODE_SETTINGS) {
-    if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); lastScroll = now; drawSettings(); }
-    if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % pageLen(setPage); lastScroll = now; drawSettings(); }
+  if (trackballOn) {
+    if (uiMode == MODE_CHAT) {
+      int before = scrollLines;
+      if (!u && tbUpPrev && now - lastScroll > 90) { scrollLines += scrollStep; lastScroll = now; }
+      if (!d && tbDnPrev && now - lastScroll > 90) { scrollLines -= scrollStep; lastScroll = now; }
+      if (scrollLines < 0) scrollLines = 0;
+      if (scrollLines != before) draw();
+    } else if (uiMode == MODE_SETTINGS) {
+      if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); lastScroll = now; drawSettings(); }
+      if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % pageLen(setPage); lastScroll = now; drawSettings(); }
+    } else if (uiMode == MODE_GAME && gGame == 0) {   // snake steering
+      bool lft = digitalRead(1), rgt = digitalRead(2);   // TB_LEFT=GPIO1, TB_RIGHT=GPIO2
+      if (!u && tbUpPrev) snakeTurn(0, -1);
+      if (!d && tbDnPrev) snakeTurn(0, 1);
+      if (!lft) snakeTurn(-1, 0);
+      if (!rgt) snakeTurn(1, 0);
+    }
   }
   tbUpPrev = u; tbDnPrev = d;
 
@@ -760,7 +1360,23 @@ void loop() {
   // KEYBOARD
   uint8_t k = readKey();
   if (k) {
-    if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
+    if (uiMode == MODE_TEXT) {
+      if (k == '\r' || k == '\n') {
+        auto cb = textCb; String v = textVal;
+        uiMode = textReturnMode;              // default landing (cb may re-open text)
+        if (cb) cb(v);
+        if (uiMode == MODE_TEXT) drawText();
+        else if (uiMode == MODE_SETTINGS) drawSettings();
+        else draw();
+      } else if (k == 27) {                   // Esc = cancel
+        uiMode = textReturnMode;
+        if (uiMode == MODE_SETTINGS) drawSettings(); else draw();
+      } else if (k == 8 || k == 127) { if (textVal.length()) textVal.remove(textVal.length() - 1); drawText(); }
+      else if (k >= 32 && k < 127) { textVal += (char)k; drawText(); }
+    }
+    else if (uiMode == MODE_GAME) { gameKey(k); }
+    else if (uiMode == MODE_MAP) { uiMode = MODE_CHAT; draw(); }        // any key exits map
+    else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
     else if (k == '\r' || k == '\n') {
       if (input.length()) {
@@ -775,19 +1391,26 @@ void loop() {
     else if (k >= 32 && k < 127) { input += (char)k; draw(); }
   }
 
-  // SERIAL commands (ask/ip + settings nav for testing + config via applyCfgCmd)
+  // USB-C SERIAL = the same interactive shell ("SSH over USB"): chat + /set + /get
+  // + all /commands, right in a serial monitor. Test verbs (click/up/down) kept.
   while (Serial.available()) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       String s = serialBuf; serialBuf = "";
-      if (s.startsWith("ask ") || s.startsWith("claude "))
-        sendPrompt(s.substring(s.indexOf(' ') + 1));
-      else if (s == "ip")
+      if (s == "ip")
         Serial.printf("ip=%s status=%d mode=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode);
       else if (s == "click") { if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
       else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
       else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
-      else { String r = applyCfgCmd(s); Serial.println(r.length() ? r : "? (try: ask/font/color/scroll/splash/settings/ip)"); }
+      else {
+        shellOut = (Print*)&Serial;
+        if (s.startsWith("ask ")) handleShellLine(s.substring(4));
+        else if (s.startsWith("claude ")) handleShellLine(s.substring(7));
+        else if (s.startsWith("/") || wizStep >= 0) handleShellLine(s);
+        else { String r = applyCfgCmd(s);          // bare config verb?
+               if (r.length()) Serial.println(r);
+               else handleShellLine(s); }           // otherwise: chat
+      }
     } else serialBuf += c;
   }
   delay(8);
