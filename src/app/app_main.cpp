@@ -1237,16 +1237,31 @@ static bool geocodePlace(const String& q, double& lat, double& lon) {
 static String ddgSearch(const String& q) {
   if (WiFi.status() != WL_CONNECTED) return "";
   String enc; for (size_t i = 0; i < q.length(); i++) { char c = q[i]; enc += (c == ' ') ? String("+") : String(c); }
-  String url = "https://api.duckduckgo.com/?q=" + enc + "&format=json&no_html=1&skip_disambig=1";
+  // DDG's HTML results endpoint returns real result snippets (the Instant Answer
+  // API is only definitions). Read a capped chunk of the page and scrape snippets.
+  String url = "https://html.duckduckgo.com/html/?q=" + enc;
   WiFiClientSecure tls; tls.setInsecure(); HTTPClient h; h.setTimeout(12000);
   if (!h.begin(tls, url)) return "";
-  int code = h.GET(); if (code != 200) { h.end(); return ""; }
-  String body = h.getString(); h.end();
-  JsonDocument d; if (deserializeJson(d, body)) return "";
-  String out = String((const char*)(d["AbstractText"] | ""));
-  int n = 0;
-  for (JsonObject t : d["RelatedTopics"].as<JsonArray>()) {
-    const char* txt = t["Text"] | ""; if (strlen(txt)) { out += "\n- " + String(txt); if (++n >= 5) break; }
+  h.setUserAgent("Mozilla/5.0 (RoostOS)");
+  const char* hdrs[] = {"Location"}; h.collectHeaders(hdrs, 1);
+  int code = h.GET();
+  if (code != 200) { h.end(); return ""; }
+  WiFiClient* st = h.getStreamPtr();
+  String body; body.reserve(50000); uint32_t t0 = millis();
+  while (h.connected() && body.length() < 48000 && millis() - t0 < 12000) {
+    while (st->available() && body.length() < 48000) body += (char)st->read();
+    if (!st->available()) delay(4);
+  }
+  h.end();
+  String out; int idx = 0, n = 0;
+  while (n < 5 && (idx = body.indexOf("result__snippet", idx)) >= 0) {
+    int gt = body.indexOf('>', idx); if (gt < 0) break;
+    int end = body.indexOf("</a>", gt); if (end < 0) break;
+    String seg = body.substring(gt + 1, end), txt; bool tag = false;
+    for (size_t i = 0; i < seg.length(); i++) { char c = seg[i]; if (c == '<') tag = true; else if (c == '>') tag = false; else if (!tag) txt += c; }
+    txt.replace("&#x27;", "'"); txt.replace("&amp;", "&"); txt.replace("&quot;", "\""); txt.replace("&#x2F;", "/"); txt.trim();
+    if (txt.length() > 8) { out += "- " + txt + "\n"; n++; }
+    idx = end;
   }
   return out;
 }
@@ -1587,8 +1602,13 @@ static void handleShellLine(String line) {
     String q = line.length() > 4 ? line.substring(5) : String(""); q.trim();
     if (!q.length()) { shellPrint("usage: /web <query>\r\n"); shellPrompt(); return; }
     shellPrint("searching DuckDuckGo...\r\n");
-    String res = ddgSearch(q); if (!res.length()) res = "(no instant answer found)";
-    String reply = deMarkdown(askAI("Using these DuckDuckGo search results, answer concisely. Query: \"" + q + "\"\nResults:\n" + res));
+    String res = ddgSearch(q);
+    String p = res.length()
+      ? "Web search results for \"" + q + "\" (via DuckDuckGo):\n" + res +
+        "\nAnswer the query concisely, drawing on these results plus what you know."
+      : "Answer concisely from your own knowledge: \"" + q +
+        "\". (A web lookup returned nothing usable — just answer directly, don't mention search results.)";
+    String reply = deMarkdown(askAI(p));
     addMsg(youLabel + " (web): " + q, userColor); addMsg(aiLabel() + ": " + reply, aiColor);
     if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
     shellPrint(reply + "\r\n(via DuckDuckGo)\r\n"); shellPrompt(); return;
