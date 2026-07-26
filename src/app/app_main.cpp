@@ -22,8 +22,11 @@
 #define KB_ADDR     0x55
 #define I2C_SDA     18
 #define I2C_SCL     8
-#define TB_UP       3    // trackball BOARD_TBOX_G01 -> scroll up
-#define TB_DOWN     2    // trackball BOARD_TBOX_G02 -> scroll down
+// Trackball direction pins (from LILYGO T-Deck UnitTest mouse_read):
+//   UP=BOARD_TBOX_G01(GPIO3)  DOWN=BOARD_TBOX_G03(GPIO15)
+//   RIGHT=BOARD_TBOX_G02(GPIO2)  LEFT=BOARD_TBOX_G04(GPIO1)
+#define TB_UP       3    // scroll up
+#define TB_DOWN     15   // scroll down
 
 #ifndef DEFAULT_WIFI_SSID
 #define DEFAULT_WIFI_SSID ""
@@ -49,7 +52,7 @@ static void setFont(int idx) {
 }
 
 // ---- configurable state (future Settings) ----
-static int chatFontIdx  = 2;   // message text size (default medium)
+static int chatFontIdx  = 1;   // message text size (default small = FreeSans 9pt)
 static int inputFontIdx = 1;   // input-box text size (default small)
 static uint16_t userColor, aiColor;   // set in setup(); configurable
 
@@ -308,9 +311,12 @@ void loop() {
   }
   // trackball scroll (falling edge = one detent)
   bool u = digitalRead(TB_UP), d = digitalRead(TB_DOWN);
-  if (!u && tbUpPrev) { scrollLines += 3; draw(); }
-  if (!d && tbDnPrev) { scrollLines -= 3; if (scrollLines < 0) scrollLines = 0; draw(); }
+  int beforeScroll = scrollLines;
+  if (u != tbUpPrev) scrollLines += 2;   // any edge = one detent (more responsive)
+  if (d != tbDnPrev) scrollLines -= 2;
   tbUpPrev = u; tbDnPrev = d;
+  if (scrollLines < 0) scrollLines = 0;
+  if (scrollLines != beforeScroll) draw();
 
   // serial dev commands
   while (Serial.available()) {
