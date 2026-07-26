@@ -1085,6 +1085,20 @@ static bool joinWifi(const String& ssid, const String& pass) {
 }
 
 // Branded boot splash: RoostOS wordmark + a little chick perched on an antenna.
+// Brief "charging connected" splash (shown when the pack voltage rises on plug-in).
+static void drawChargeSplash() {
+  tft.fillScreen(C_BG); tft.setTextDatum(MC_DATUM);
+  int w = 128, h = 58, x = (scrW - w) / 2, y = (scrH - h) / 2 - 8;
+  tft.drawRoundRect(x, y, w, h, 6, C_TEAL); tft.fillRect(x + w, y + h / 2 - 8, 6, 16, C_TEAL);   // battery + nub
+  int pct = batteryPct(); tft.fillRect(x + 3, y + 3, (w - 6) * pct / 100, h - 6, C_TEAL);
+  // lightning bolt (amber)
+  int cx = scrW / 2, cy = y + h / 2;
+  tft.fillTriangle(cx + 4, cy - 16, cx - 8, cy + 3, cx + 2, cy + 3, C_AMBER);
+  tft.fillTriangle(cx - 4, cy + 16, cx + 8, cy - 3, cx - 2, cy - 3, C_AMBER);
+  tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_AMBER, C_BG);
+  tft.drawString("Charging  " + String(pct) + "%", scrW / 2, y + h + 22);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+}
 static void drawSplash() {
   tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
   tft.setFreeFont(&FreeSans18pt7b);
@@ -1726,6 +1740,14 @@ void loop() {
   pollGps();
   if (uiMode == MODE_GAME) gameTick();
 
+  // charge-connected detection (no dedicated pin; infer from a voltage rise)
+  { static bool prevChg = false; static uint32_t chgT = 0;
+    if (now - chgT > 1500) { chgT = now;
+      bool c = batteryCharging();
+      if (c && !prevChg && uiMode == MODE_CHAT) { drawChargeSplash(); delay(1400); draw(); }
+      prevChg = c;
+    } }
+
   // trackball CLICK (GPIO0): chat -> open settings; settings -> activate selection
   bool clk = digitalRead(TB_CLICK);
   if (!clk && clkPrev && now - clkT > 220) {
@@ -1871,7 +1893,7 @@ void loop() {
     if (c == '\n' || c == '\r') {
       String s = serialBuf; serialBuf = "";
       if (s == "ip")
-        Serial.printf("ip=%s status=%d mode=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode);
+        Serial.printf("ip=%s status=%d mode=%d rssi=%ddBm lvl=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode, (int)WiFi.RSSI(), wifiLevel());
       else if (s == "click") { if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
       else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
       else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
