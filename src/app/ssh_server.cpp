@@ -199,3 +199,9 @@ void sshServerStop() {
   if (!sshTaskRunning) return;
   sshWantStop = true;   // task exits its loops and self-deletes
 }
+// Forget the persisted host key so a fresh one is generated on next start.
+// (The key normally persists in NVS across reflashes, so clients don't warn.)
+void sshRegenHostKey() {
+  Preferences p; p.begin("roostssh", false); p.remove("hostkey"); p.end();
+  if (sshTaskRunning) sshServerStop();   // main loop restarts it -> generates a new key
+}

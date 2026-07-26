@@ -55,10 +55,10 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 #define GEOAPIFY_KEY ""
 #endif
 #ifndef SSH_USER
-#define SSH_USER "roost"
+#define SSH_USER ""
 #endif
 #ifndef SSH_PASS
-#define SSH_PASS "roostos"
+#define SSH_PASS ""
 #endif
 #ifndef ANTHROPIC_API_KEY
 #define ANTHROPIC_API_KEY ""
@@ -129,8 +129,12 @@ static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
 static bool    webSearchOn = false;                // allow AI web search (roadmap)
 static bool    remoteShellOn = false;              // TCP shell on port 23
-static bool    demoMode = false;                   // mask WiFi SSID as "Demo" for photos
-static bool    sshOn = false;                      // real SSH server on port 22
+// Status-bar mode: IP = SSID+IP; DEMO = masked ("Demo") for photos; PHONE = wifi
+// bars + battery + clock (no SSID/IP). Each renders differently.
+enum { STAT_IP, STAT_DEMO, STAT_PHONE };
+static int     statusMode = STAT_IP;
+// SSH: default ON only if creds were configured in secrets; else off (safe default).
+static bool    sshOn = (SSH_USER[0] != '\0' && SSH_PASS[0] != '\0');
 static String  sshUser = SSH_USER, sshPass = SSH_PASS;   // SSH login (from secrets, editable)
 static String  mapKey     = GEOAPIFY_KEY;          // Geoapify static-map key
 // WiFi override set on-device (empty => fall back to secrets.h DEFAULT_WIFI_*)
@@ -160,7 +164,20 @@ static void applyBrightness() {
   ledcWrite(0, constrain(brightness, 8, 255));
 }
 // Network name for display — masked to "Demo" when demo mode is on (for photos).
-static String dispSsid() { return demoMode ? String("Demo") : WiFi.SSID(); }
+static String dispSsid() { return statusMode != STAT_IP ? String("Demo") : WiFi.SSID(); }
+static const char* statusName() { return statusMode == STAT_IP ? "IP" : statusMode == STAT_DEMO ? "Demo" : "Phone"; }
+// battery percent from the GPIO4 ADC (board divider ~x2; 3.3V=0%, 4.2V=100%)
+static int batteryPct() {
+  uint32_t mv = analogReadMilliVolts(4) * 2;
+  int pct = (int)(((long)mv - 3300) * 100 / (4200 - 3300));
+  return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+}
+// wifi signal level 0..4 from RSSI
+static int wifiLevel() {
+  if (WiFi.status() != WL_CONNECTED) return 0;
+  int r = WiFi.RSSI();
+  return r > -55 ? 4 : r > -65 ? 3 : r > -72 ? 2 : r > -82 ? 1 : 0;
+}
 
 static void saveCfg() {
   prefs.begin("roostcomm", false);
@@ -188,7 +205,7 @@ static void saveCfg() {
   prefs.putString("kOai", kOpenAI);
   prefs.putString("kGem", kGemini);
   prefs.putString("olHost", ollamaHost);
-  prefs.putBool("demo", demoMode);
+  prefs.putInt("statMode", statusMode);
   prefs.putBool("sshOn", sshOn);
   prefs.putString("sshUser", sshUser);
   prefs.putString("sshPass", sshPass);
@@ -226,7 +243,7 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   kOpenAI      = prefs.getString("kOai", kOpenAI);
   kGemini      = prefs.getString("kGem", kGemini);
   ollamaHost   = prefs.getString("olHost", ollamaHost);
-  demoMode     = prefs.getBool("demo", demoMode);
+  statusMode   = prefs.getInt("statMode", statusMode);
   sshOn        = prefs.getBool("sshOn", sshOn);
   sshUser      = prefs.getString("sshUser", sshUser);
   sshPass      = prefs.getString("sshPass", sshPass);
@@ -268,7 +285,7 @@ static int uiMode = MODE_CHAT;
 static int selIdx = 0;
 // Settings are organized as a main page with per-category sub-pages (BlackBerry
 // style: <=6 options each, item 0 is always Back). selIdx indexes the current page.
-enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_COUNT };
+enum { PG_MAIN, PG_APPS, PG_DISPLAY, PG_COLORS, PG_AI, PG_DEVICE, PG_SYSTEM, PG_SSH, PG_COUNT };
 static int setPage = PG_MAIN;
 static int setFirst = 0;     // first visible row (settings scroll window)
 static String setMsg = "";   // transient status line (e.g. provider switch result)
@@ -327,13 +344,35 @@ static void draw() {
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
   int rx = 4 + tft.textWidth("RoostOS");
-  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" Communicator", rx, 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" AI", rx, 4);   // compact; full name on splash/banner
   // menu button (hamburger) top-right — tap to open Settings
   for (int b = 0; b < 3; b++) tft.fillRect(scrW - 20, 3 + b * 4, 15, 2, C_AMBER);
-  String net = WiFi.status() == WL_CONNECTED
-    ? (dispSsid() + " " + WiFi.localIP().toString()) : String("WiFi down");
+  int rEdge = scrW - 24;   // content ends left of the menu button
+  auto drawBars = [&](int x)->int {                 // wifi bars, returns left x used
+    int lvl = wifiLevel();
+    for (int i = 0; i < 4; i++) { int h = 3 + i * 2;
+      tft.fillRect(x + i * 4, 11 - h, 3, h, i < lvl ? C_TEAL : C_PANEL);
+      tft.drawRect(x + i * 4, 11 - h, 3, h, i < lvl ? C_TEAL : C_DIM); }
+    return x;
+  };
   tft.setTextColor(C_DIM, C_PANEL);
-  tft.drawString(net, scrW - tft.textWidth(net) - 24, 4);
+  if (WiFi.status() != WL_CONNECTED && statusMode != STAT_PHONE) {
+    String s = "WiFi down"; tft.drawString(s, rEdge - tft.textWidth(s), 4);
+  } else if (statusMode == STAT_IP) {               // SSID + IP
+    String s = WiFi.SSID() + " " + WiFi.localIP().toString();
+    tft.drawString(s, rEdge - tft.textWidth(s), 4);
+  } else if (statusMode == STAT_DEMO) {             // "Demo" + bars (no ssid/ip)
+    int bx = rEdge - 16; drawBars(bx);
+    String s = "Demo"; tft.drawString(s, bx - 6 - tft.textWidth(s), 4);
+  } else {                                          // PHONE: bars + battery% + clock
+    int bx = rEdge - 16; drawBars(bx);
+    int bpct = batteryPct(); String bs = String(bpct) + "%";
+    int batX = bx - 6 - tft.textWidth(bs); tft.drawString(bs, batX, 4);
+    time_t nowt = time(nullptr);
+    if (nowt > 1700000000) { nowt += (time_t)tzOffsetMin * 60; struct tm tmv; gmtime_r(&nowt, &tmv);
+      char c[8]; strftime(c, sizeof(c), "%H:%M", &tmv);
+      tft.drawString(c, batX - 6 - tft.textWidth(c), 4); }
+  }
 
   // input-box metrics (its own font)
   setFont(inputFontIdx);
@@ -401,6 +440,7 @@ static void draw();
 static void showMap(double lat, double lon, int zoom);
 static void gameLaunch(int which);
 static void startCalibration();
+void sshRegenHostKey();
 
 // Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
 static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
@@ -432,7 +472,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("Sounds", soundsOn ? "on" : "off");
       row("Trackball", trackballOn ? "on" : "off");
       row("Web search", webSearchOn ? "on" : "off");
-      row("Demo mode", demoMode ? "on (SSID hidden)" : "off");
+      row("Status bar", statusName());
       row("Calibrate touch", touchCalValid ? "done" : "needed");
       return "Device";
     case PG_DISPLAY:
@@ -465,12 +505,18 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       row("WiFi setup", WiFi.isConnected() ? dispSsid() : String("down"));
       row("Remote shell", remoteShellOn ? "on :23" : "off");
       row("SSH server", sshOn ? "on :22" : "off");
-      row("SSH user", sshUser);
-      row("SSH pass", sshPass);
       row("Map key", strlen(mapKey.c_str()) ? "set" : "none");
       row("IP", WiFi.localIP().toString());
       row("Uptime", String(millis() / 1000) + "s");
       return "System";
+    case PG_SSH:
+      row("< Back", "");
+      row("Enabled", sshOn ? "on :22" : "off");
+      row("User", sshUser.length() ? sshUser : String("(unset)"));
+      row("Password", sshPass.length() ? sshPass : String("(unset)"));
+      row("Connect", WiFi.isConnected() ? ("ssh " + (sshUser.length() ? sshUser : String("user")) + "@" + WiFi.localIP().toString()) : String("wifi down"));
+      row("Regen host key", ">");
+      return "SSH";
   }
   return "Settings";
 }
@@ -544,7 +590,7 @@ static void drawAbout() {
   row("MAC", WiFi.macAddress());
   row("IP", WiFi.localIP().toString());
   row("WiFi", dispSsid() + " " + String(WiFi.RSSI()) + "dBm");
-  row("Demo mode", demoMode ? "ON (SSID hidden)" : "off");
+  row("Status bar", statusName());
   row("Heap", String(ESP.getFreeHeap() / 1024) + "K free");
   row("PSRAM", String(ESP.getFreePsram() / 1024) + "K free");
   row("Uptime", String(millis() / 1000) + "s");
@@ -621,8 +667,8 @@ static void activateSetting() {
     }
     drawSettings(); return;
   }
-  // sub-pages: item 0 is Back to the main page
-  if (selIdx == 0) { setPage = PG_MAIN; selIdx = 0; drawSettings(); return; }
+  // sub-pages: item 0 is Back (SSH lives under System; others under Main)
+  if (selIdx == 0) { setPage = (setPage == PG_SSH) ? PG_SYSTEM : PG_MAIN; selIdx = 0; drawSettings(); return; }
 
   switch (setPage) {
     case PG_APPS:
@@ -681,7 +727,7 @@ static void activateSetting() {
         case 5: soundsOn    = !soundsOn;    break;
         case 6: trackballOn = !trackballOn; break;
         case 7: webSearchOn = !webSearchOn; break;
-        case 8: demoMode = !demoMode; break;   // mask SSID for photos
+        case 8: statusMode = (statusMode + 1) % 3; break;   // cycle IP/Demo/Phone
         case 9: startCalibration(); return;    // Calibrate touch
       }
       break;
@@ -699,20 +745,27 @@ static void activateSetting() {
             });
           return;
         case 3: remoteShellOn = !remoteShellOn; break;                  // Remote (TCP) shell toggle
-        case 4: sshOn = !sshOn; break;                                  // SSH server toggle
-        case 5:  // SSH user
-          openText("SSH user", sshUser, "login name for ssh", false, MODE_SETTINGS,
-                   [](String v){ sshUser = v.length() ? v : String("roost"); saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
-          return;
-        case 6:  // SSH password (shown in cleartext by request)
-          openText("SSH password", sshPass, "password for ssh login", false, MODE_SETTINGS,
-                   [](String v){ sshPass = v.length() ? v : String("roostos"); saveCfg(); setPage = PG_SYSTEM; selIdx = 6; });
-          return;
-        case 7:  // Map key entry
+        case 4: setPage = PG_SSH; selIdx = 0; break;                    // SSH server -> its own page
+        case 5:  // Map key entry
           openText("Map key (Geoapify)", mapKey, "paste your API key", false, MODE_SETTINGS,
-                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 7; });
+                   [](String v){ mapKey = v; saveCfg(); setPage = PG_SYSTEM; selIdx = 5; });
           return;
         // IP / Uptime rows are read-only status
+      }
+      break;
+    case PG_SSH:
+      switch (selIdx) {
+        case 1: sshOn = !sshOn; break;   // Enabled toggle (only starts if creds set)
+        case 2:  // User
+          openText("SSH user", sshUser, "login name for ssh", false, MODE_SETTINGS,
+                   [](String v){ sshUser = v; saveCfg(); setPage = PG_SSH; selIdx = 2; });
+          return;
+        case 3:  // Password (cleartext, per request)
+          openText("SSH password", sshPass, "login password for ssh", false, MODE_SETTINGS,
+                   [](String v){ sshPass = v; saveCfg(); setPage = PG_SSH; selIdx = 3; });
+          return;
+        // case 4 Connect: read-only helper text
+        case 5: sshRegenHostKey(); setMsg = "new host key (clients must re-accept)"; break;
       }
       break;
   }
@@ -1161,7 +1214,14 @@ static String applyCfgCmd(String s) {
   if (cmdIs(tok, "trackball")) { trackballOn = (rest != "off" && rest != "0"); saveCfg(); return String("trackball: ") + (trackballOn ? "on" : "off"); }
   if (cmdIs(tok, "websearch")) { webSearchOn = (rest == "on" || rest == "1"); saveCfg(); return String("web search: ") + (webSearchOn ? "on" : "off"); }
   if (cmdIs(tok, "shell")) { remoteShellOn = (rest == "on" || rest == "1"); saveCfg(); return String("remote shell: ") + (remoteShellOn ? "on (port 23)" : "off"); }
-  if (cmdIs(tok, "demo")) { demoMode = (rest == "on" || rest == "1"); saveCfg(); if (uiMode == MODE_CHAT) draw(); return String("demo mode: ") + (demoMode ? "on (SSID hidden)" : "off"); }
+  if (cmdIs(tok, "status") || cmdIs(tok, "demo")) {   // status bar mode
+    String v = rest; v.toLowerCase();
+    if (v.startsWith("ip") || v == "off") statusMode = STAT_IP;
+    else if (v.startsWith("demo") || v == "on") statusMode = STAT_DEMO;
+    else if (v.startsWith("phone")) statusMode = STAT_PHONE;
+    else return "status: ip | demo | phone";
+    saveCfg(); if (uiMode == MODE_CHAT) draw(); return String("status bar: ") + statusName();
+  }
   if (cmdIs(tok, "ssh")) { sshOn = (rest == "on" || rest == "1"); saveCfg();
     return String("ssh: ") + (sshOn ? "on - ssh " + sshUser + "@<ip> (pw set in /sshpass)" : "off"); }
   if (cmdIs(tok, "sshuser")) { if (rest.length()) { sshUser = rest; saveCfg(); } return "ssh user: " + sshUser; }
@@ -1278,7 +1338,7 @@ static void showMap(double lat, double lon, int zoom) {
 //  (Plain TCP now; real SSH via libssh_esp32 is the next transport step.)
 // ============================================================================
 // ---- real SSH server (src/app/ssh_server.cpp), driven from this shell ----
-void sshServerStart(); void sshServerStop();
+void sshServerStart(); void sshServerStop(); void sshRegenHostKey();
 bool sshPopLine(String& out); void sshQueueOut(const char* s);
 bool sshActive(); bool sshIsRunning();
 extern "C" void sshSetCreds(const char* u, const char* p);
@@ -1320,7 +1380,7 @@ static Print* shellOut = nullptr;
 static void shellPrint(const String& s) { if (shellOut) shellOut->print(s); }
 static void shellPrompt() { shellPrint("\r\nroost> "); }
 static void shellBanner() {
-  shellPrint(String("\r\n=== RoostOS Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
+  shellPrint(String("\r\n=== RoostOS AI Communicator ") + ROOST_COMM_VERSION + " ===\r\n");
   shellPrint("A handheld AI communicator. You're connected over the network.\r\n");
   shellPrint("Just type to chat. Commands: /help  /set  /get  /quit\r\n");
 }
@@ -1644,7 +1704,7 @@ void loop() {
   if (shellStarted) pollShell();
 
   // real SSH server lifecycle + input marshaling (runs in its own task)
-  if (sshOn && WiFi.status() == WL_CONNECTED && !sshIsRunning()) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); sshServerStart(); }
+  if (sshOn && sshUser.length() && sshPass.length() && WiFi.status() == WL_CONNECTED && !sshIsRunning()) { sshSetCreds(sshUser.c_str(), sshPass.c_str()); sshServerStart(); }
   else if (!sshOn && sshIsRunning()) sshServerStop();
   { static bool sshWas = false; bool sa = sshActive();
     if (sa && !sshWas) { shellOut = (Print*)&sshSink; shellBanner(); shellPrompt(); }
