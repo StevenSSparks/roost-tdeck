@@ -864,12 +864,26 @@ static String aiLabel() {
   return "Haiku";
 }
 
+// Light markdown stripper for the tiny screen: drop **bold**/__/` markers and
+// leading # header hashes so they don't render as literal clutter. Not a renderer.
+static String deMarkdown(String s) {
+  s.replace("**", ""); s.replace("__", ""); s.replace("`", "");
+  int i = 0;
+  while ((i = s.indexOf('#', i)) >= 0) {
+    if (i == 0 || s[i - 1] == '\n') {           // only header hashes at line start
+      int j = i; while (j < (int)s.length() && (s[j] == '#' || s[j] == ' ')) j++;
+      s.remove(i, j - i);
+    } else i++;
+  }
+  return s;
+}
+
 static void sendPrompt(const String& prompt) {
   scrollLines = 0;
   String lbl = aiLabel() + ": ";
   addMsg(youLabel + ": " + prompt, userColor);
   addMsg("...", C_DIM); draw();
-  String reply = askAI(prompt);
+  String reply = deMarkdown(askAI(prompt));
   Serial.println(lbl + reply);
   if (!msgs.empty()) msgs.pop_back();       // remove "..."
   addMsg(lbl + reply, aiColor);
@@ -1351,7 +1365,7 @@ static void handleShellLine(String line) {
   addMsg(youLabel + " (ssh): " + line, userColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint("...\r\n");
-  String reply = askAI(line);
+  String reply = deMarkdown(askAI(line));
   addMsg(aiLabel() + ": " + reply, aiColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint(aiLabel() + ": " + reply + "\r\n");
