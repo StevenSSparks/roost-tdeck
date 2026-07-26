@@ -1359,12 +1359,24 @@ static void snakeDraw() {
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("Snake", 4, 4);
   tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), 52, 4);
-  tft.setTextColor(C_DIM, C_PANEL); tft.drawString(gDead ? "DEAD-key" : "ball/WASD", scrW - 88, 4);
+  tft.setTextColor(C_DIM, C_PANEL); tft.drawString("tap/ball/WASD", scrW - 108, 4);
   drawQuitX();
   int oy = headerH;
   tft.fillRect(gFoodX * CELL, oy + gFoodY * CELL, CELL - 1, CELL - 1, C_AMBER);
   for (size_t i = 0; i < snake.size(); i++)
     tft.fillRect(snake[i].first * CELL, oy + snake[i].second * CELL, CELL - 1, CELL - 1, i == 0 ? C_TEAL : C_INDIGO);
+  if (gDead) {                                   // GAME OVER overlay + restart prompt
+    int bw = 190, bh = 74, bx = (scrW - bw) / 2, by = (scrH - bh) / 2;
+    tft.fillRoundRect(bx, by, bw, bh, 6, C_PANEL);
+    tft.drawRoundRect(bx, by, bw, bh, 6, C_TEAL);
+    tft.setTextDatum(MC_DATUM);
+    tft.setFreeFont(&FreeSans12pt7b); tft.setTextColor(C_AMBER, C_PANEL);
+    tft.drawString("GAME OVER", scrW / 2, by + 20);
+    tft.setTextFont(1); tft.setTextSize(1);
+    tft.setTextColor(C_INK, C_PANEL); tft.drawString("score " + String(gScore), scrW / 2, by + 42);
+    tft.setTextColor(C_DIM, C_PANEL); tft.drawString("tap or press a key to play again", scrW / 2, by + 58);
+    tft.setTextDatum(TL_DATUM);
+  }
 }
 static void snakeStep() {
   if (gDead) return;
@@ -1518,8 +1530,9 @@ static void gameKey(uint8_t k) {
     sudokuDraw();
   }
 }
-static void gameTick() {   // snake auto-advance
-  if (gGame == 0 && !gDead && millis() - gTickT > 170) { gTickT = millis(); snakeStep(); }
+static void gameTick() {   // snake auto-advance; starts gentle, speeds up with score
+  int period = 220 - gScore * 6; if (period < 90) period = 90;
+  if (gGame == 0 && !gDead && millis() - gTickT > (uint32_t)period) { gTickT = millis(); snakeStep(); }
 }
 
 void loop() {
@@ -1601,6 +1614,16 @@ void loop() {
         uiMode = MODE_CHAT; draw();                 // tap anywhere closes the map
       } else if (uiMode == MODE_GAME) {
         if (sx > scrW - 18 && sy < headerH + 2) { uiMode = MODE_CHAT; draw(); }   // [X] quit
+        else if (gGame == 0) {                      // Snake: tap to steer / restart
+          if (gDead) { snakeInit(); snakeDraw(); }
+          else {
+            int oy = headerH;
+            int hcx = snake[0].first * CELL + CELL / 2, hcy = oy + snake[0].second * CELL + CELL / 2;
+            int ddx = sx - hcx, ddy = sy - hcy;
+            if (abs(ddx) > abs(ddy)) snakeTurn(ddx > 0 ? 1 : -1, 0);   // steer toward the tap
+            else                     snakeTurn(0, ddy > 0 ? 1 : -1);
+          }
+        }
         else if (gGame == 1) {                      // Sudoku: tap cell, then tap a number
           int G = SU_G, ox = suOX(), oy = SU_OY, ny = suPadY(), bw = suPadBW();
           if (sy >= oy && sy < oy + G * 9 && sx >= ox && sx < ox + G * 9) {
