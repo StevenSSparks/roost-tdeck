@@ -125,15 +125,14 @@ static void addMsg(const String& t, uint16_t color) {
 // wrap one message to fit maxW px in the CURRENT font
 static void wrapMsg(const String& text, int maxW, std::vector<String>& out) {
   String line; int i = 0, n = text.length();
-  while (i <= n) {
-    if (i == n) { out.push_back(line); break; }
+  while (i < n) {
     int j = i; while (j < n && text[j] != ' ' && text[j] != '\n') j++;
     String word = text.substring(i, j);
     String trial = line.length() ? line + " " + word : word;
     if (tft.textWidth(trial) <= maxW) line = trial;
     else {
       if (line.length()) { out.push_back(line); line = ""; }
-      if (tft.textWidth(word) > maxW) {
+      if (tft.textWidth(word) > maxW) {                 // hard-break a too-long word
         String part;
         for (int k = 0; k < (int)word.length(); k++) {
           String t2 = part + word[k];
@@ -146,6 +145,7 @@ static void wrapMsg(const String& text, int maxW, std::vector<String>& out) {
     if (j < n && text[j] == '\n') { out.push_back(line); line = ""; }
     i = j + 1;
   }
+  out.push_back(line);   // always emit the final line (this was the "You:"-disappearing bug)
 }
 
 static void draw() {
