@@ -141,6 +141,11 @@ static uint16_t namedColor(const String& n) {
 enum { MODE_CHAT, MODE_SETTINGS, MODE_ABOUT };
 static int uiMode = MODE_CHAT;
 static int selIdx = 0;
+// Settings are organized as a main page with per-category sub-pages (BlackBerry
+// style: <=6 options each, item 0 is always Back). selIdx indexes the current page.
+enum { PG_MAIN, PG_DISPLAY, PG_COLORS, PG_AI, PG_SYSTEM, PG_COUNT };
+static int setPage = PG_MAIN;
+static String setMsg = "";   // transient status line (e.g. provider switch result)
 static const char* PAL_NAMES[] = {"teal","indigo","amber","red","green","cyan","magenta","orange","ink"};
 static const int NPAL = 9;
 static int palIndexOf(uint16_t c) { for (int i = 0; i < NPAL; i++) if (namedColor(PAL_NAMES[i]) == c) return i; return 0; }
@@ -246,46 +251,90 @@ static void draw() {
   tft.drawString(shown, 2 + pw, inputY + 2);
 }
 
-// ---- Settings screen (trackball-navigated) ----
-static const char* SET_ITEMS[] = {
-  "Back to chat", "Chat font", "Input font", "You color", "Haiku color", "Scroll rate", "Splash", "About"
-};
-static const int N_SET = 8;
+// ---- Settings screen: main page + per-category sub-pages ----
+// forward decls (defined later in the file)
+static bool switchProvider(const String& p, String& msg);
+static bool providerConfigured(const String& p);
+static String defaultModel(const String& p);
 
-static String setValue(int i) {
-  switch (i) {
-    case 1: return FONTS[chatFontIdx].name;
-    case 2: return FONTS[inputFontIdx].name;
-    case 3: return PAL_NAMES[palIndexOf(userColor)];
-    case 4: return PAL_NAMES[palIndexOf(aiColor)];
-    case 5: return String(scrollStep);
-    case 6: return String(splashMs / 1000.0, 1) + "s";
-    default: return "";
+// Fill labels[]/values[] for a page and return its title. Item 0 is always Back.
+static String buildPage(int pg, std::vector<String>& labels, std::vector<String>& values) {
+  labels.clear(); values.clear();
+  auto row = [&](const char* l, const String& v){ labels.push_back(l); values.push_back(v); };
+  switch (pg) {
+    case PG_MAIN:
+      row("Back to chat", "");
+      row("Display", ">"); row("Colors", ">");
+      row("AI Provider", aiProvider);
+      row("System / About", ">");
+      return "Settings";
+    case PG_DISPLAY:
+      row("< Back", "");
+      row("Chat font",  FONTS[chatFontIdx].name);
+      row("Input font", FONTS[inputFontIdx].name);
+      row("Scroll rate", String(scrollStep));
+      row("Splash", String(splashMs / 1000.0, 1) + "s");
+      return "Display";
+    case PG_COLORS:
+      row("< Back", "");
+      row("Your color", PAL_NAMES[palIndexOf(userColor)]);
+      row("AI color",   PAL_NAMES[palIndexOf(aiColor)]);
+      return "Colors";
+    case PG_AI: {
+      row("< Back", "");
+      for (int k = 0; k < NPROV; k++) {
+        String p = PROVIDERS[k];
+        String tag = (p == aiProvider ? "* " : "  ");
+        tag += providerConfigured(p) ? "ready" : "no key";
+        row(p == aiProvider ? ("[" + p + "]").c_str() : p.c_str(), tag);
+      }
+      row("Model", aiModel.length() ? aiModel : defaultModel(aiProvider));
+      return "AI Provider";
+    }
+    case PG_SYSTEM:
+      row("< Back", "");
+      row("About", ">");
+      row("WiFi", WiFi.isConnected() ? WiFi.SSID() : String("down"));
+      row("IP", WiFi.localIP().toString());
+      row("Uptime", String(millis() / 1000) + "s");
+      return "System";
   }
+  return "Settings";
+}
+
+static int pageLen(int pg) {
+  std::vector<String> l, v; buildPage(pg, l, v); return (int)l.size();
 }
 
 static void drawSettings() {
+  std::vector<String> labels, values;
+  String title = buildPage(setPage, labels, values);
   tft.fillScreen(C_BG); tft.setTextDatum(TL_DATUM);
   tft.setTextFont(1); tft.setTextSize(1);
   tft.fillRect(0, 0, scrW, headerH, C_PANEL);
   tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("RoostOS", 4, 4);
-  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" Settings", 4 + tft.textWidth("RoostOS"), 4);
+  tft.setTextColor(C_INK, C_PANEL); tft.drawString(" " + title, 4 + tft.textWidth("RoostOS"), 4);
   setFont(1);   // small
   int lh = tft.fontHeight() + 6, y = headerH + 6;
-  for (int i = 0; i < N_SET; i++) {
-    if (i == selIdx) { tft.fillRect(0, y - 2, scrW, lh, C_PANEL); }
-    uint16_t c = (i == selIdx) ? C_AMBER : C_INK;
-    if (i == 3) c = (i == selIdx) ? C_AMBER : userColor;
-    if (i == 4) c = (i == selIdx) ? C_AMBER : aiColor;
-    tft.setTextColor(c, (i == selIdx) ? C_PANEL : C_BG);
-    tft.drawString(SET_ITEMS[i], 6, y);
-    String v = setValue(i);
-    if (v.length()) { tft.setTextColor((i == selIdx) ? C_INK : C_DIM, (i == selIdx) ? C_PANEL : C_BG);
-                      tft.drawString(v, scrW - tft.textWidth(v) - 8, y); }
+  for (int i = 0; i < (int)labels.size(); i++) {
+    bool sel = (i == selIdx);
+    if (sel) tft.fillRect(0, y - 2, scrW, lh, C_PANEL);
+    uint16_t c = sel ? C_AMBER : C_INK;
+    // colour swatch preview on the Colors page
+    if (setPage == PG_COLORS && i == 1 && !sel) c = userColor;
+    if (setPage == PG_COLORS && i == 2 && !sel) c = aiColor;
+    tft.setTextColor(c, sel ? C_PANEL : C_BG);
+    tft.drawString(labels[i], 6, y);
+    if (values[i].length()) {
+      tft.setTextColor(sel ? C_INK : C_DIM, sel ? C_PANEL : C_BG);
+      tft.drawString(values[i], scrW - tft.textWidth(values[i]) - 8, y);
+    }
     y += lh;
   }
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextColor(C_DIM, C_BG);
-  tft.drawString("ball: roll=move  click=change  (or type /set)", 4, scrH - 12);
+  if (setMsg.length()) tft.drawString(setMsg, 4, scrH - 12);
+  else tft.drawString(setPage == PG_MAIN ? "ball: roll=move  click=open  (or /set)"
+                                         : "ball: roll=move  click=change  < Back to return", 4, scrH - 12);
 }
 
 static void drawAbout() {
@@ -312,18 +361,68 @@ static void drawAbout() {
   tft.setTextColor(C_AMBER, C_BG); tft.drawString("tap / any key = back", 4, scrH - 12);
 }
 
+// pick the next model in a small per-provider preset ring
+static String nextModel(const String& p, const String& cur) {
+  const char* an[] = {"claude-haiku-4-5", "claude-sonnet-4-6"};
+  const char* oa[] = {"gpt-4o-mini", "gpt-4o"};
+  const char* ge[] = {"gemini-2.0-flash-lite", "gemini-2.0-flash"};
+  const char* ol[] = {"llama3.2", "qwen2.5", "phi3"};
+  const char** L; int n;
+  if (p == "openai")      { L = oa; n = 2; }
+  else if (p == "gemini") { L = ge; n = 2; }
+  else if (p == "ollama") { L = ol; n = 3; }
+  else                    { L = an; n = 2; }
+  String c = cur.length() ? cur : defaultModel(p);
+  int idx = 0; for (int i = 0; i < n; i++) if (c == L[i]) idx = i;
+  return String(L[(idx + 1) % n]);
+}
+
 static void activateSetting() {
-  if (selIdx == 7) { uiMode = MODE_ABOUT; drawAbout(); return; }   // About
-  switch (selIdx) {
-    case 0: uiMode = MODE_CHAT; draw(); return;
-    case 1: chatFontIdx = (chatFontIdx + 1) % NFONTS; break;
-    case 2: inputFontIdx = (inputFontIdx + 1) % NFONTS; break;
-    case 3: userColor = namedColor(PAL_NAMES[(palIndexOf(userColor) + 1) % NPAL]); break;
-    case 4: aiColor   = namedColor(PAL_NAMES[(palIndexOf(aiColor) + 1) % NPAL]); break;
-    case 5: scrollStep = scrollStep >= 8 ? 1 : scrollStep + 1; break;
-    case 6: { int opts[] = {0, 1500, 3000, 5000}; int cur = 0;
-              for (int k = 0; k < 4; k++) if (opts[k] == splashMs) cur = k;
-              splashMs = opts[(cur + 1) % 4]; break; }
+  setMsg = "";
+  if (setPage == PG_MAIN) {
+    switch (selIdx) {
+      case 0: uiMode = MODE_CHAT; draw(); return;         // Back to chat
+      case 1: setPage = PG_DISPLAY; selIdx = 0; break;
+      case 2: setPage = PG_COLORS;  selIdx = 0; break;
+      case 3: setPage = PG_AI;      selIdx = 0; break;
+      case 4: setPage = PG_SYSTEM;  selIdx = 0; break;
+    }
+    drawSettings(); return;
+  }
+  // sub-pages: item 0 is Back to the main page
+  if (selIdx == 0) { setPage = PG_MAIN; selIdx = 0; drawSettings(); return; }
+
+  switch (setPage) {
+    case PG_DISPLAY:
+      switch (selIdx) {
+        case 1: chatFontIdx  = (chatFontIdx + 1) % NFONTS; break;
+        case 2: inputFontIdx = (inputFontIdx + 1) % NFONTS; break;
+        case 3: scrollStep = scrollStep >= 8 ? 1 : scrollStep + 1; break;
+        case 4: { int opts[] = {0, 1500, 3000, 5000}; int cur = 0;
+                  for (int k = 0; k < 4; k++) if (opts[k] == splashMs) cur = k;
+                  splashMs = opts[(cur + 1) % 4]; break; }
+      }
+      break;
+    case PG_COLORS:
+      if (selIdx == 1) userColor = namedColor(PAL_NAMES[(palIndexOf(userColor) + 1) % NPAL]);
+      if (selIdx == 2) aiColor   = namedColor(PAL_NAMES[(palIndexOf(aiColor)   + 1) % NPAL]);
+      break;
+    case PG_AI: {
+      int modelRow = 1 + NPROV;   // rows 1..NPROV are providers, then Model
+      if (selIdx >= 1 && selIdx <= NPROV) {
+        String cand = PROVIDERS[selIdx - 1];
+        if (cand == aiProvider) { setMsg = cand + " already active"; }
+        else if (!providerConfigured(cand)) { setMsg = cand + ": no key configured"; }
+        else { switchProvider(cand, setMsg); }   // verify-then-switch (pings local Ollama)
+      } else if (selIdx == modelRow) {
+        aiModel = nextModel(aiProvider, aiModel); saveCfg();
+      }
+      break;
+    }
+    case PG_SYSTEM:
+      if (selIdx == 1) { uiMode = MODE_ABOUT; drawAbout(); return; }   // About
+      // WiFi/IP/Uptime rows are read-only status
+      break;
   }
   saveCfg(); drawSettings();
 }
@@ -589,7 +688,7 @@ static String applyCfgCmd(String s) {
   int sp = s.indexOf(' ');
   String tok = (sp < 0 ? s : s.substring(0, sp)); tok.toLowerCase();
   String rest = (sp < 0 ? String("") : s.substring(sp + 1)); rest.trim();
-  if (cmdIs(tok, "settings")) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); return " "; }
+  if (cmdIs(tok, "settings")) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); return " "; }
   if (cmdIs(tok, "font")) { chatFontIdx = fontArgToIdx(rest, chatFontIdx); saveCfg(); draw(); return String("chat font: ") + FONTS[chatFontIdx].name; }
   if (cmdIs(tok, "inputfont")) { inputFontIdx = fontArgToIdx(rest, inputFontIdx); saveCfg(); draw(); return String("input font: ") + FONTS[inputFontIdx].name; }
   if (cmdIs(tok, "color")) {
@@ -620,8 +719,8 @@ void loop() {
   bool clk = digitalRead(TB_CLICK);
   if (!clk && clkPrev && now - clkT > 220) {
     clkT = now; Serial.println("[click]");
-    if (uiMode == MODE_CHAT) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
-    else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; drawSettings(); }
+    if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }
+    else if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else activateSetting();
   }
   clkPrev = clk;
@@ -635,8 +734,8 @@ void loop() {
     if (scrollLines < 0) scrollLines = 0;
     if (scrollLines != before) draw();
   } else if (uiMode == MODE_SETTINGS) {
-    if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + N_SET) % N_SET; lastScroll = now; drawSettings(); }
-    if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % N_SET; lastScroll = now; drawSettings(); }
+    if (!u && tbUpPrev && now - lastScroll > 150) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); lastScroll = now; drawSettings(); }
+    if (!d && tbDnPrev && now - lastScroll > 150) { selIdx = (selIdx + 1) % pageLen(setPage); lastScroll = now; drawSettings(); }
   }
   tbUpPrev = u; tbDnPrev = d;
 
@@ -648,12 +747,12 @@ void loop() {
       Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", rx, ry, sx, sy, uiMode);
       lastTouch = now;
       if (uiMode == MODE_CHAT) {
-        if (sy < headerH && sx > scrW - 26) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
+        if (sy < headerH && sx > scrW - 26) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
       } else if (uiMode == MODE_ABOUT) {
-        uiMode = MODE_SETTINGS; drawSettings();
+        uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
       } else {
         setFont(1); int lh = tft.fontHeight() + 6; int row = (sy - (headerH + 4)) / lh;
-        if (row >= 0 && row < N_SET) { selIdx = row; activateSetting(); }
+        if (row >= 0 && row < pageLen(setPage)) { selIdx = row; activateSetting(); }
       }
     }
   }
@@ -661,7 +760,7 @@ void loop() {
   // KEYBOARD
   uint8_t k = readKey();
   if (k) {
-    if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; drawSettings(); }
+    if (uiMode == MODE_ABOUT) { uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings(); }
     else if (uiMode == MODE_SETTINGS) { uiMode = MODE_CHAT; draw(); }   // any key exits settings
     else if (k == '\r' || k == '\n') {
       if (input.length()) {
@@ -685,9 +784,9 @@ void loop() {
         sendPrompt(s.substring(s.indexOf(' ') + 1));
       else if (s == "ip")
         Serial.printf("ip=%s status=%d mode=%d\n", WiFi.localIP().toString().c_str(), (int)WiFi.status(), uiMode);
-      else if (s == "click") { if (uiMode == MODE_CHAT) { uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
-      else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % N_SET; drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
-      else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + N_SET) % N_SET; drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
+      else if (s == "click") { if (uiMode == MODE_CHAT) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); } else activateSetting(); Serial.printf("mode=%d sel=%d\n", uiMode, selIdx); }
+      else if (s == "down")  { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx + 1) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
+      else if (s == "up")    { if (uiMode == MODE_SETTINGS) { selIdx = (selIdx - 1 + pageLen(setPage)) % pageLen(setPage); drawSettings(); } Serial.printf("sel=%d\n", selIdx); }
       else { String r = applyCfgCmd(s); Serial.println(r.length() ? r : "? (try: ask/font/color/scroll/splash/settings/ip)"); }
     } else serialBuf += c;
   }
