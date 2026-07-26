@@ -131,6 +131,8 @@ static String  wifiSsid = "", wifiPass = "";
 static double  locLat = 0, locLon = 0; static bool locValid = false;
 // AI-requested map (set when the model calls the show_map tool; rendered after reply)
 static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
+// last map shown (persisted) so /map can reopen it without a GPS fix
+static double  lastMapLat = 0, lastMapLon = 0; static bool lastMapValid = false;
 static TinyGPSPlus gps;
 static HardwareSerial GPSser(1);
 // TJpg_Decoder -> TFT block callback (defined early; used in setup + showMap)
@@ -174,6 +176,9 @@ static void saveCfg() {
   prefs.putBool("sshOn", sshOn);
   prefs.putString("sshUser", sshUser);
   prefs.putString("sshPass", sshPass);
+  prefs.putDouble("mapLat", lastMapLat);
+  prefs.putDouble("mapLon", lastMapLon);
+  prefs.putBool("mapVal", lastMapValid);
   prefs.end();
 }
 static void loadCfg() {   // call AFTER colors + defaults are set
@@ -203,6 +208,9 @@ static void loadCfg() {   // call AFTER colors + defaults are set
   sshOn        = prefs.getBool("sshOn", sshOn);
   sshUser      = prefs.getString("sshUser", sshUser);
   sshPass      = prefs.getString("sshPass", sshPass);
+  lastMapLat   = prefs.getDouble("mapLat", 0);
+  lastMapLon   = prefs.getDouble("mapLon", 0);
+  lastMapValid = prefs.getBool("mapVal", false);
   prefs.end();
 }
 
@@ -361,7 +369,7 @@ static String buildPage(int pg, std::vector<String>& labels, std::vector<String>
       return "Settings";
     case PG_APPS:
       row("< Back", "");
-      row("Map", locValid ? "gps" : "no fix");
+      row("Map", locValid ? "gps" : (lastMapValid ? "saved" : "no fix"));
       row("Snake", ">");
       row("Sudoku", ">");
       row("GPS status", locValid ? String(locLat, 3) + "," + String(locLon, 3) : String("no fix"));
@@ -542,8 +550,9 @@ static void activateSetting() {
   switch (setPage) {
     case PG_APPS:
       switch (selIdx) {
-        case 1: if (locValid) { showMap(locLat, locLon, 14); return; }
-                setMsg = "no GPS fix; use /map <lat> <lon>"; break;
+        case 1: if (locValid)     { showMap(locLat, locLon, 14); return; }        // GPS
+                if (lastMapValid) { showMap(lastMapLat, lastMapLon, 14); return; } // last saved
+                setMsg = "no location; use /map <lat> <lon>"; break;
         case 2: gameLaunch(0); return;   // Snake
         case 3: gameLaunch(1); return;   // Sudoku
         case 4: setMsg = locValid ? "gps fix ok" : "no fix (sats " + String(gps.satellites.value()) + ")"; break;
@@ -992,9 +1001,12 @@ static String applyCfgCmd(String s) {
     return "gps: no fix yet (sats:" + String(gps.satellites.value()) + ")";
   }
   if (tok == "map") {        // exact-match (so it doesn't collide with 'mapkey')
-    double la = locLat, lo = locLon;
-    if (rest.length()) { int q = rest.indexOf(' '); if (q > 0) { la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); } }
-    else if (!locValid) return "no GPS fix yet - try: map <lat> <lon>";
+    double la, lo;
+    if (rest.length()) { int q = rest.indexOf(' '); if (q <= 0) return "usage: map <lat> <lon>";
+                         la = rest.substring(0, q).toFloat(); lo = rest.substring(q + 1).toFloat(); }
+    else if (locValid)     { la = locLat; lo = locLon; }        // 1) live GPS
+    else if (lastMapValid) { la = lastMapLat; lo = lastMapLon; } // 2) last saved map
+    else return "no location yet - try: map <lat> <lon>";
     showMap(la, lo, 14); return "map";
   }
   if (tok == "game") { String g = rest; g.toLowerCase();
@@ -1077,9 +1089,13 @@ static void showMap(double lat, double lon, int zoom) {
   tft.fillScreen(C_BG);
   TJpgDec.drawJpg(0, 8, buf, got);
   free(buf);
-  tft.setTextFont(1); tft.setTextSize(1);
-  tft.setTextColor(C_AMBER); tft.setTextDatum(TL_DATUM);
-  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : " (set)"), 4, scrH - 11);
+  // remember this location so /map can reopen it without a fix
+  lastMapLat = lat; lastMapLon = lon; lastMapValid = true; saveCfg();
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(C_AMBER, C_BG);
+  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : ""), 4, scrH - 11);
+  tft.setTextColor(C_DIM, C_BG);
+  tft.drawString("key/click/tap = close", scrW - 118, scrH - 11);
 }
 
 // ============================================================================
@@ -1384,9 +1400,11 @@ void loop() {
       lastTouch = now;
       if (uiMode == MODE_CHAT) {
         if (sy < headerH && sx > scrW - 26) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // menu button
+      } else if (uiMode == MODE_MAP || uiMode == MODE_GAME) {
+        uiMode = MODE_CHAT; draw();                 // tap closes map / game
       } else if (uiMode == MODE_ABOUT) {
         uiMode = MODE_SETTINGS; setPage = PG_SYSTEM; selIdx = 1; drawSettings();
-      } else {
+      } else if (uiMode == MODE_SETTINGS) {
         setFont(1); int lh = tft.fontHeight() + 6; int row = (sy - (headerH + 4)) / lh;
         if (row >= 0 && row < pageLen(setPage)) { selIdx = row; activateSetting(); }
       }
