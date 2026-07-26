@@ -122,6 +122,8 @@ git push -u origin main
 // time from the macOS keychain by scripts/gen_secrets.py and is gitignored.
 #define ANTHROPIC_API_KEY ""
 #define GEOAPIFY_KEY ""
+#define DEFAULT_WIFI_SSID ""
+#define DEFAULT_WIFI_PASS ""
 ```
 
 - [ ] **Step 2: Write `scripts/gen_secrets.py`**
@@ -133,7 +135,10 @@ import subprocess, os, sys
 ITEMS = {
     "ANTHROPIC_API_KEY": "anthropic_api_key_sparkshost",
     "GEOAPIFY_KEY": "gtoapify_key_sfehost",
+    "DEFAULT_WIFI_PASS": "SSS-MAIN",  # keychain service holding the home-WiFi password
 }
+# Fixed (not a secret): the home-WiFi SSID matches the keychain service name.
+FIXED = { "DEFAULT_WIFI_SSID": "SSS-MAIN" }
 
 def keychain(item):
     try:
@@ -151,6 +156,8 @@ for macro, item in ITEMS.items():
     val = keychain(item)
     if val is None:
         missing.append(item); val = ""
+    lines.append(f'#define {macro} "{val}"')
+for macro, val in FIXED.items():
     lines.append(f'#define {macro} "{val}"')
 
 if missing:
@@ -652,7 +659,7 @@ Expected: builds clean.
 - Consumes: `configToKV`/`configFromKV` (Task 4).
 - Produces: `AppConfig settingsLoad();` (reads each KV key from `Preferences`, applies `configFromKV`, seeds from `secrets.h` under `DEV_SECRETS` when the stored key is empty), `void settingsSave(const AppConfig&);`, plus saved-WiFi and saved-MAC list helpers: `std::vector<std::pair<String,String>> savedNetworks();` `void saveNetwork(String ssid,String pass);` `std::vector<String> savedMacs(); void saveMac(String);`.
 
-- [ ] **Step 1:** Implement over `Preferences` (namespace `"roostcomm"`). On load, if `anthropicKey`/`geoapifyKey` empty and `DEV_SECRETS` defined, seed from `ANTHROPIC_API_KEY`/`GEOAPIFY_KEY` and persist.
+- [ ] **Step 1:** Implement over `Preferences` (namespace `"roostcomm"`). On load, if `anthropicKey`/`geoapifyKey` empty and `DEV_SECRETS` defined, seed from `ANTHROPIC_API_KEY`/`GEOAPIFY_KEY` and persist. Also, when `DEV_SECRETS` is defined, `savedNetworks()` is empty, and `DEFAULT_WIFI_SSID` is non-empty, seed one saved network via `saveNetwork(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS)` so the device auto-joins the home network on first boot.
 - [ ] **On-device acceptance:** serial prints loaded model/theme; after `settingsSave` with a changed persona, a reboot shows the new persona. With `DEV_SECRETS`, keys are non-empty on first boot.
 - [ ] **Step 2: Commit** — `git commit -am "feat(cfg): NVS settings store + keychain seed"`.
 
