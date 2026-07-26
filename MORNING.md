@@ -1,5 +1,30 @@
 # RoostOS Communicator — Morning Status
 
+## Session 4 (2026-07-26 pt2) — comms, maps, games, terminal config
+Branch `m2-comms-config` (open a PR to main). All built + hardware-verified serial:
+- **Terminal chat + config** — the full interactive shell (chat with the AI + `/set`
+  wizard + `/get` + every `/command`) runs over **USB-C serial** AND a **TCP :23
+  network shell** (Settings toggle). This is the "SSH to the handheld" feature;
+  real SSH (libssh) is the next transport. Shell output uses a `Print*` sink.
+- **Runtime-overridable keys** (NVS): `/key anthropic|openai|gemini <k>`, `/ollama`,
+  `/wifi`, `/mapkey`. Flash with only WiFi, paste keys over the shell — no rebuild.
+- **On-screen maps** — `/map [lat lon]` fetches a Geoapify static JPEG, renders via
+  TJpg_Decoder. **AI `show_map` tool** (Anthropic tool loop): "show me a map of X"
+  → device shows it. `get_location` tool reads GPS. Verified http=200 + render.
+- **GPS** (L76K UART1 43/44) + **NTP** → AI is time-aware and greets by **name**.
+- **Games**: Snake (trackball/WASD) + Sudoku (QWERTY). Apps settings page.
+- **Expanded config** (all NVS): name, timezone, brightness (LEDC), sounds,
+  trackball on/off, web-search flag, remote-shell toggle, on-device WiFi join.
+- **Fix**: `WiFi.setSleep(false)` for reliable inbound TCP (ESP32 modem-sleep).
+
+**Network caveat:** the TCP shell needs the Wi-Fi to allow client-to-client traffic
+(disable AP/client isolation on the SSID). USB-C shell works regardless.
+**Gotcha fixed:** `map` vs `mapkey` command-prefix collision had overwritten the
+stored map key in NVS; routing fixed + key restored.
+
+---
+
+
 ## Session 3 (2026-07-26) — multi-provider + categorized Settings + config UX
 **Done & on the device (env:app, verified over serial):**
 - **Multi-provider AI:** Anthropic / OpenAI / Gemini / **local Ollama**. `askAI()`

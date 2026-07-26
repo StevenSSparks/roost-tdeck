@@ -17,13 +17,21 @@ Claude over WiFi on a pocket QWERTY device with a real screen. Part of the
   answers before activating**.
 - Branded **boot splash** (the RoostOS chick-on-antenna).
 - A **categorized Settings menu** (BlackBerry-style): a main page with
-  per-category sub-pages — **Display**, **Colors**, **AI Provider**, **System /
-  About** — each with a Back item.
-- Smooth, **adjustable fonts** (message + input independently) and **configurable
-  colors**, and **scrollback**.
-- Everything you change is **saved** (survives reboot).
-- Physical QWERTY input; trackball to scroll + navigate settings. (Touch, maps,
-  GPS, and games are on the roadmap below.)
+  per-category sub-pages — **Apps**, **Display**, **Colors**, **AI Provider**,
+  **Device**, **System / About** — each with a Back item.
+- **On-screen maps** 🗺️ — Geoapify static maps rendered on the LCD; center on
+  GPS or any coordinates (`/map <lat> <lon>`). The AI can **show you a map** by
+  calling a `show_map` tool (e.g. *"show me a map of Paris"*).
+- **GPS** (L76K) for location + time; **NTP** time sync so the AI is time-aware.
+- **Games** 🐍 — Snake (trackball/WASD) and Sudoku (QWERTY).
+- **Configure from a terminal** — chat with the AI and change every setting over
+  **USB-C serial** or a **network shell** (see below). Flash with just WiFi, then
+  paste your API keys over the shell — no rebuild.
+- **Personalization**: your name (the AI greets you), timezone, backlight
+  brightness, sounds, trackball on/off, and more — all **saved** (survive reboot).
+- Smooth, **adjustable fonts** and **configurable colors**, **scrollback**.
+- Physical QWERTY input; trackball to scroll + navigate. (Touch calibration and
+  real SSH are on the roadmap below.)
 
 ## Hardware
 **LILYGO T-Deck Plus** (ESP32-S3, 16 MB flash, 8 MB PSRAM, 2.8" 320×240 ST7789,
@@ -96,6 +104,31 @@ pio device monitor -e app     # (optional) watch the serial console
   `/scroll <n>` · `/splash <ms>` · `/provider anthropic|openai|gemini|ollama` ·
   `/model <name>` · `/settings` · `/set`, `/fon`, `/col` …
 
+## Configure from a terminal (chat + settings, no rebuild)
+The Communicator is also an **AI chat app you can drive from a terminal** — great
+for advanced setup or pasting long API keys. Two ways in:
+
+**USB-C (always works):** plug in and open a serial monitor:
+```sh
+pio device monitor -e app      # or: screen /dev/cu.usbmodem101 115200
+```
+**Network shell:** turn on *Settings → System → Remote shell*, then from any
+computer **on the same network**:
+```sh
+nc <device-ip> 23              # or: telnet <device-ip>
+```
+Then, in either:
+- **Just type** to chat with the AI (shared with the on-screen chat).
+- `/set` — interactive **setup wizard** (name, timezone, API keys, provider,
+  WiFi, brightness…). `/get` shows current config. `/help` lists commands.
+- `/key anthropic sk-ant-…` · `/provider gemini` · `/wifi <ssid> <pass>` ·
+  `/mapkey <key>` · `/name <you>` · `/map <lat> <lon>` · `/snake` · `/sudoku`
+
+> Typical flow for a fresh board: flash with only your WiFi set, boot, connect
+> USB-C (or `nc` if reachable), run `/set`, paste your keys — done, no rebuild.
+> **Network shell note:** your Wi-Fi must allow client-to-client traffic (disable
+> "AP/client isolation" on the SSID). USB-C works regardless.
+
 ## Build environments
 | Env | What |
 |-----|------|
@@ -104,11 +137,14 @@ pio device monitor -e app     # (optional) watch the serial console
 | `native`| Off-device unit tests: `pio test -e native`. |
 
 ## Roadmap
-Touch (GT911) as primary input + tap Settings + swipe scroll · on-screen tool use
-(Claude reads GPS / battery / renders **maps**) · GPS screen · WiFi/API editing +
-more toggles in Settings · remote shell (telnet now, **SSH** later) · **games**
-(Snake, Sudoku) · custom boot artwork · WiFi auto-reconnect. See `MORNING.md` and
-`docs/superpowers/plans/` for the working plan.
+**Done:** multi-provider chat · categorized Settings · on-screen maps + AI
+`show_map` · GPS + NTP time-awareness · terminal chat/config over USB-C and TCP ·
+runtime key config (no rebuild) · Snake + Sudoku · on-device WiFi + personalization.
+
+**Next:** real **SSH** (libssh_esp32) replacing the plain-TCP shell · **touch**
+(GT911) calibration → tap Settings + swipe scroll · turn-by-turn **directions** ·
+battery ADC calibration · custom boot artwork · WiFi auto-reconnect · web search.
+See `MORNING.md` and `docs/superpowers/plans/` for the working plan.
 
 ## Safety
 No secrets are ever committed. Stock firmware can be backed up before flashing
