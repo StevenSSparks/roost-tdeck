@@ -1,4 +1,34 @@
-# RoostOS Communicator — Morning Status (2026-07-25 night build)
+# RoostOS Communicator — Morning Status
+
+## Session 3 (2026-07-26) — multi-provider + categorized Settings + config UX
+**Done & on the device (env:app, verified over serial):**
+- **Multi-provider AI:** Anthropic / OpenAI / Gemini / **local Ollama**. `askAI()`
+  branches per provider; provider + model persist in NVS. Reply is labelled
+  (Haiku/GPT/Gemini/Ollama). **Verify-then-switch:** `switchProvider()` only
+  activates a provider whose key is configured, and **pings a local Ollama
+  (`/api/tags`) before switching** — confirmed on hardware: Anthropic answers,
+  Gemini transport/auth correct (owner's demo key is quota-exhausted → limit 0),
+  Ollama switch **correctly refused** when `ai.senzall.net:11434` was unreachable.
+- **Categorized Settings** (the BlackBerry ask): a main page → per-category
+  sub-pages **Display / Colors / AI Provider / System-About**, each ≤6 items with
+  item 0 = Back. AI Provider page lists all four with `ready`/`no key` + `*` on
+  active. Trackball/touch/serial nav all use `pageLen(setPage)`. Nav verified.
+- **Config builder (computer-side UX):** `tools/config/index.html` — a
+  self-contained, offline page that generates `secrets.h` from a form (WiFi +
+  keys + default provider). Nothing is uploaded. Also **hosted** at
+  **roostos.dev/tdeck/config** (in the `roostos-web` repo).
+- **roostos.dev/tdeck** landing page added to `roostos-web`.
+- README updated (four providers, categorized Settings, config builder,
+  `/provider` + `/model` commands).
+
+**Still open (unchanged priorities):** GT911 touch calibration; on-screen tool
+loop (GPS/battery/map); WiFi/API editing on device + more toggles; remote
+shell/SSH; games; real chick PNG on splash; test Ollama once the box is reachable
+from the device's VLAN (Ollama must listen on `0.0.0.0:11434`).
+
+---
+
+# (earlier) Morning Status (2026-07-25 night build)
 
 ## 🎉 It works on the device
 The T-Deck is flashed with the **on-screen app** (`env:app`): boots, shows the

@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RoostOS Communicator — Config Builder</title>
+<style>
+  :root{
+    --bg:#0e1512; --panel:#132420; --ink:#e6efe9; --dim:#7f9a8f;
+    --teal:#2fd6b0; --amber:#ffcc4d; --line:#22403a; --danger:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:24px}
+  .wrap{max-width:860px;margin:0 auto}
+  h1{color:var(--teal);font-size:26px;margin:0 0 2px}
+  h1 small{color:var(--amber);font-weight:normal;font-size:15px}
+  .sub{color:var(--dim);margin:0 0 22px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  fieldset{border:1px solid var(--line);border-radius:10px;background:var(--panel);
+           padding:14px 16px 18px;margin:0}
+  legend{color:var(--teal);font-weight:600;padding:0 6px}
+  label{display:block;margin:12px 0 4px;color:var(--ink);font-weight:500}
+  label .hint{display:block;color:var(--dim);font-weight:normal;font-size:12.5px}
+  input,select{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:7px;
+        background:#0b120f;color:var(--ink);font:14px ui-monospace,Menlo,Consolas,monospace}
+  input:focus,select:focus{outline:none;border-color:var(--teal)}
+  a{color:var(--amber)}
+  .out{margin-top:22px}
+  .out h2{color:var(--teal);font-size:17px;margin:0 0 8px}
+  pre{background:#0b120f;border:1px solid var(--line);border-radius:10px;padding:16px;
+      overflow:auto;white-space:pre;color:#cfe;font:13px ui-monospace,Menlo,Consolas,monospace}
+  .bar{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px;align-items:center}
+  button{background:var(--teal);color:#04120d;border:0;border-radius:8px;padding:11px 18px;
+         font-weight:700;font-size:15px;cursor:pointer}
+  button.ghost{background:transparent;color:var(--teal);border:1px solid var(--teal)}
+  button:active{transform:translateY(1px)}
+  .note{color:var(--dim);font-size:13px;margin-top:6px}
+  .warn{color:var(--danger);border:1px solid var(--danger);border-radius:8px;padding:10px 12px;
+        margin:18px 0;background:rgba(255,107,107,.06)}
+  .ok{color:var(--teal)}
+  .steps{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 18px;margin:20px 0}
+  .steps ol{margin:8px 0 0;padding-left:20px} .steps li{margin:6px 0}
+  code{background:#0b120f;border:1px solid var(--line);border-radius:4px;padding:1px 5px;
+       font:12.5px ui-monospace,Menlo,monospace;color:var(--amber)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RoostOS Communicator 🐤📡 <small>config builder</small></h1>
+  <p class="sub">Fill this in, download your <code>secrets.h</code>, drop it in <code>include/</code>, flash. Runs entirely in your browser — nothing is uploaded or saved anywhere.</p>
+
+  <div class="warn">🔒 Your keys never leave this page. The file you download is git-ignored (<code>include/secrets.h</code>) — never commit it.</div>
+
+  <div class="grid">
+    <fieldset>
+      <legend>WiFi (2.4 GHz)</legend>
+      <label>Network name (SSID)
+        <span class="hint">The ESP32-S3 is 2.4 GHz only — pick a 2.4 GHz SSID.</span>
+        <input id="ssid" placeholder="MyHomeWiFi" autocomplete="off"></label>
+      <label>Password
+        <input id="wpass" type="text" placeholder="wifi password" autocomplete="off"></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>Default AI provider</legend>
+      <label>Boot provider
+        <span class="hint">Only providers you give a key/host below can be activated on the device.</span>
+        <select id="provider">
+          <option value="anthropic">Anthropic (Claude) — recommended</option>
+          <option value="openai">OpenAI (GPT)</option>
+          <option value="gemini">Google Gemini</option>
+          <option value="ollama">Ollama (local, no key)</option>
+        </select></label>
+      <label>Geoapify key <span class="hint">Optional — maps. <a href="https://myprojects.geoapify.com" target="_blank" rel="noopener">get a free key</a></span>
+        <input id="geo" placeholder="(optional)" autocomplete="off"></label>
+    </fieldset>
+  </div>
+
+  <fieldset style="margin-top:18px">
+    <legend>AI provider keys — set the one(s) you'll use, leave the rest empty</legend>
+    <div class="grid">
+      <div>
+        <label>Anthropic API key
+          <span class="hint"><a href="https://console.anthropic.com" target="_blank" rel="noopener">console.anthropic.com</a> → API Keys → Create Key (starts <code>sk-ant-</code>)</span>
+          <input id="anthropic" placeholder="sk-ant-..." autocomplete="off"></label>
+        <label>OpenAI API key
+          <span class="hint"><a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">platform.openai.com/api-keys</a> (starts <code>sk-</code>)</span>
+          <input id="openai" placeholder="sk-..." autocomplete="off"></label>
+      </div>
+      <div>
+        <label>Gemini API key
+          <span class="hint"><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">aistudio.google.com/app/apikey</a> (free tier available)</span>
+          <input id="gemini" placeholder="AIza..." autocomplete="off"></label>
+        <label>Ollama host
+          <span class="hint">Local LLM on your LAN, no key. host:port — e.g. <code>192.168.1.50:11434</code></span>
+          <input id="ollama" placeholder="(optional) host:11434" autocomplete="off"></label>
+      </div>
+    </div>
+  </fieldset>
+
+  <div class="out">
+    <h2>include/secrets.h <span id="status" class="note"></span></h2>
+    <pre id="preview"></pre>
+    <div class="bar">
+      <button id="download">⬇ Download secrets.h</button>
+      <button id="copy" class="ghost">Copy to clipboard</button>
+      <span id="copied" class="ok note"></span>
+    </div>
+  </div>
+
+  <div class="steps">
+    <strong>Then, on your computer:</strong>
+    <ol>
+      <li>Move the downloaded file to <code>include/secrets.h</code> in your clone of the repo.</li>
+      <li>Install PlatformIO: <code>brew install platformio</code> (or the VS Code extension).</li>
+      <li>Flash it: <code>pio run -e app -t upload</code> (T-Deck on USB-C).</li>
+      <li>Type a message + Enter to chat. Trackball click opens Settings.</li>
+    </ol>
+    <p class="note">Prefer the command line? <code>cp include/secrets.example.h include/secrets.h</code> and edit by hand — same result.</p>
+  </div>
+</div>
+
+<script>
+  var ids = ["ssid","wpass","anthropic","openai","gemini","ollama","provider","geo"];
+  function esc(s){ return String(s).replace(/\\/g,"\\\\").replace(/"/g,'\\"'); }
+  function val(id){ return document.getElementById(id).value.trim(); }
+  function build(){
+    var prov = val("provider");
+    var lines = [
+      "#pragma once",
+      "// Generated by the RoostOS Communicator config builder. Git-ignored — never commit.",
+      "",
+      "// --- WiFi (2.4 GHz network) ---",
+      '#define DEFAULT_WIFI_SSID "' + esc(val("ssid")) + '"',
+      '#define DEFAULT_WIFI_PASS "' + esc(val("wpass")) + '"',
+      "",
+      "// --- AI providers (empty = unavailable on device) ---",
+      '#define ANTHROPIC_API_KEY "' + esc(val("anthropic")) + '"',
+      '#define OPENAI_API_KEY    "' + esc(val("openai")) + '"',
+      '#define GEMINI_API_KEY    "' + esc(val("gemini")) + '"',
+      '#define OLLAMA_HOST       "' + esc(val("ollama")) + '"',
+      "",
+      '// Provider selected on first boot: "anthropic" | "openai" | "gemini" | "ollama"',
+      '#define DEFAULT_AI_PROVIDER "' + prov + '"',
+      "",
+      "// --- Maps (optional) ---",
+      '#define GEOAPIFY_KEY "' + esc(val("geo")) + '"',
+      ""
+    ];
+    document.getElementById("preview").textContent = lines.join("\n");
+
+    // sanity: does the chosen default provider have what it needs?
+    var st = document.getElementById("status");
+    var need = {anthropic:"anthropic", openai:"openai", gemini:"gemini", ollama:"ollama"}[prov];
+    var ok = prov === "ollama" ? !!val("ollama") : !!val(need);
+    if(ok){ st.textContent = "✓ default provider (" + prov + ") is configured"; st.style.color = "var(--teal)"; }
+    else  { st.textContent = "⚠ default provider (" + prov + ") has no key/host yet"; st.style.color = "var(--amber)"; }
+  }
+  ids.forEach(function(id){ document.getElementById(id).addEventListener("input", build); });
+  document.getElementById("download").addEventListener("click", function(){
+    var blob = new Blob([document.getElementById("preview").textContent], {type:"text/plain"});
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "secrets.h";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  document.getElementById("copy").addEventListener("click", function(){
+    navigator.clipboard.writeText(document.getElementById("preview").textContent).then(function(){
+      var c = document.getElementById("copied"); c.textContent = "copied!";
+      setTimeout(function(){ c.textContent = ""; }, 1800);
+    });
+  });
+  build();
+</script>
+</body>
+</html>
