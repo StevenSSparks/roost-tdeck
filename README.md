@@ -31,7 +31,9 @@ Claude over WiFi on a pocket QWERTY device with a real screen. Part of the
 - **On-screen maps + routing** 🗺️ — Geoapify static maps rendered on the LCD:
   center on GPS or any coordinates/place (`/map <lat lon|place>`), **labeled** with
   the place name and zoomed to street level. The AI drives them via `show_map` and
-  `show_route` (routes auto-fit the view and show distance + time). Maps are
+  `show_route` — routes work metro-to-cross-country, auto-fit the view, and the AI
+  reads back **turn-by-turn text directions** (distance, time, numbered steps)
+  alongside the map. Maps are
   **cached**, so the lower-left **`map`** chip reopens the last one instantly.
   Location falls back **GPS → saved home/zip → IP geolocation → Gateway Arch**.
 - **GPS** (L76K) for location + time; **NTP** time sync so the AI is time-aware.

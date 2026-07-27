@@ -16,6 +16,28 @@
 #include <TinyGPSPlus.h>
 #include <Preferences.h>
 #include <vector>
+
+// ArduinoJson allocator backed by PSRAM — for large responses (e.g. long routes) that would
+// overflow the ~300KB internal heap. The T-Deck has 8MB PSRAM.
+struct PsramJsonAlloc : ArduinoJson::Allocator {
+  void* allocate(size_t n) override { return ps_malloc(n); }
+  void deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { return ps_realloc(p, n); }
+};
+static PsramJsonAlloc gPsramAlloc;
+
+// A Stream that captures written bytes into a PSRAM buffer — lets HTTPClient::writeToStream()
+// de-chunk a large response body straight into PSRAM (heap Strings can't hold ~100KB+).
+struct PsramBufStream : Stream {
+  uint8_t* buf; size_t cap, len;
+  PsramBufStream(size_t c) : buf((uint8_t*)ps_malloc(c)), cap(c), len(0) {}
+  size_t write(uint8_t b) override { if (len < cap) buf[len++] = b; return 1; }
+  size_t write(const uint8_t* d, size_t n) override { size_t k = (len + n <= cap) ? n : (cap - len); if (k) { memcpy(buf + len, d, k); len += k; } return n; }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+};
 #include <vector>
 #include <functional>
 #include "secrets.h"
@@ -67,8 +89,10 @@ static uint8_t gtAddr = 0;   // GT911 touch controller address (0 = not found)
 
 static const char* SYS_PROMPT =
   "You are RoostOS, a friendly assistant on a small handheld device with a tiny "
-  "pixel-font screen. Reply in plain ASCII text only: no markdown, no headings, "
-  "no bullet symbols, no emoji, no special/unicode characters. Keep replies short.";
+  "pixel-font screen. Reply in plain ASCII for a narrow screen. You MAY use short "
+  "numbered lists (1. 2. 3.), '-' bullets, and blank lines between items - these "
+  "read well. Do NOT use markdown markers: no **bold**, no __, no `backticks`, no # "
+  "headings, no tables, no [links](). No emoji or unicode. Keep replies short.";
 
 static const char* PROVIDERS[] = {"anthropic", "openai", "gemini", "ollama"};
 static const int NPROV = 4;
@@ -148,6 +172,7 @@ static double  locLat = 0, locLon = 0; static bool locValid = false;
 static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0; static String pMapLabel; static int pMapZoom = 16;
 static bool    mapChip = false;   // AI found a place/route: show a tappable "map" chip instead of auto-opening
 static bool    pendingRoute = false; static double rFromLat = 0, rFromLon = 0, rToLat = 0, rToLon = 0; static String rMode, rLabel;
+static String  gRouteMapUrl, gRouteLabel, gRouteCaption; static bool gRouteOk = false;   // prebuilt route map (fetched at tool time, drawn after the reply)
 static bool    symBar = false;   // on-screen number/symbol row (touch) so you can type digits/symbols for addresses
 static int     gInputY = 0, gInputH = 0;   // input-bar geometry, shared between draw() and touch hit-testing
 static const char kSymRow0[11] = "1234567890";
@@ -506,7 +531,8 @@ static bool joinWifi(const String& ssid, const String& pass);
 static String activeSsid();
 static void draw();
 static void showMap(double lat, double lon, int zoom, const String& label = "");
-static void showRoute(double fLat, double fLon, double tLat, double tLon, const String& mode, const String& label);
+static String buildRoute(double fLat, double fLon, double tLat, double tLon, const String& mode, const String& label);
+static void renderRoute();
 static String ddgSearch(const String& q);
 static bool geocodePlace(const String& q, double& lat, double& lon);
 static void gameLaunch(int which);
@@ -884,8 +910,10 @@ static String buildSysPrompt() {
     s += " For places, businesses, addresses, prices, or anything current, call web_search FIRST "
          "to get real facts and an address - do not guess. When you have a specific place, call "
          "show_map with its lat/lon and a short label (the place name) to show it on screen. "
-         "For directions or 'how do I get to X', call show_route with the destination lat/lon, a "
-         "label, and mode (drive/walk/bicycle); it uses the device location as the start.";
+         "For directions, call show_route ONCE with to_place (and from_place if given, else the "
+         "device location is the start) and mode (drive/walk/bicycle). Its result already contains "
+         "the distance, time, and numbered turn-by-turn steps - just relay those to the user. Do "
+         "NOT call show_route again or web_search the same places; trust the first result.";
   return s;
 }
 
@@ -972,6 +1000,7 @@ static String askAI(const String& prompt) {
       JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
       sc["properties"]["query"]["type"] = "string"; sc["properties"]["query"]["description"] = "search terms";
       JsonArray rq = sc["required"].to<JsonArray>(); rq.add("query"); }
+    bool didRoute = false; int nSearch = 0;   // enforce: one route per turn; cap searches (Haiku over-uses tools)
     for (int round = 0; round < 6; round++) {   // allow multi-step: web_search -> show_map -> summarize
       String body; serializeJson(req, body);
       p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
@@ -1010,11 +1039,16 @@ static String askAI(const String& prompt) {
             if (!b["input"]["from_lat"].isNull()) { rFromLat = b["input"]["from_lat"] | 0.0; rFromLon = b["input"]["from_lon"] | 0.0; }
             else if (fromPlace.length()) { aiNote("finding " + fromPlace + "..."); if (!geocodePlace(fromPlace, rFromLat, rFromLon)) resolveLocation(rFromLat, rFromLon, src); }
             else resolveLocation(rFromLat, rFromLon, src);
-            if (!okTo) { res = "could not find destination '" + toPlace + "'"; }
-            else { aiNote("routing " + rMode + " to " + rLabel + "..."); pendingRoute = true; res = "route displayed on device"; }
+            if (didRoute) { res = "A route was already computed this turn (see the previous tool result). STOP calling tools and give the user the directions now."; }
+            else if (!okTo) { res = "could not find destination '" + toPlace + "'"; }
+            else { aiNote("routing " + rMode + " to " + rLabel + "..."); res = buildRoute(rFromLat, rFromLon, rToLat, rToLon, rMode, rLabel); pendingRoute = gRouteOk; didRoute = true; if (!gRouteOk) res += " (routing failed on this device - just tell the user the rough distance/time and major highways from your own knowledge; do not call show_route again)"; }
           }
           else if (name == "get_location") { aiNote("getting your location..."); double la, lo; String src; resolveLocation(la, lo, src); res = String(la, 5) + "," + String(lo, 5) + " (" + src + ")"; }
-          else if (name == "web_search") { String q = (const char*)(b["input"]["query"] | ""); aiNote("searching the web: " + q); res = ddgSearch(q); if (!res.length()) res = "(no results found)"; }
+          else if (name == "web_search") {
+            String q = (const char*)(b["input"]["query"] | "");
+            if (++nSearch > 3) { res = "(search limit reached - answer with what you already have; do not search again)"; }
+            else { aiNote("searching the web: " + q); res = ddgSearch(q); if (!res.length()) res = "(no results found)"; }
+          }
           else res = "unknown tool";
           tuId.push_back((const char*)(b["id"] | "")); tuRes.push_back(res);
         }
@@ -1119,7 +1153,7 @@ static void sendPrompt(const String& prompt) {
   wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
-  if (openRouteNow)     showRoute(rFromLat, rFromLon, rToLat, rToLon, rMode, rLabel);   // auto-open; chip stays for reopen
+  if (openRouteNow)     renderRoute();   // draw the prebuilt route map; chip stays for reopen
   else if (openMapNow)  showMap(pMapLat, pMapLon, pMapZoom, pMapLabel);
 }
 
@@ -1634,39 +1668,44 @@ static void showMap(double lat, double lon, int zoom, const String& label) {
   fetchStaticMap(url, label, String(clat) + "," + clon + (locValid ? " (gps)" : ""));
 }
 // Route (fLat,fLon)->(tLat,tLon) by mode ("drive"/"walk"/"bicycle"): draw the line + endpoints, auto-fit.
-static void showRoute(double fLat, double fLon, double tLat, double tLon, const String& mode, const String& label) {
-  uiMode = MODE_MAP;
-  if (!mapKey.length())            { mapMsg("No map key. Set one:  /mapkey <key>"); return; }
-  if (WiFi.status() != WL_CONNECTED){ mapMsg("Map needs WiFi."); return; }
-  mapMsg("Finding route...");
+// Fetch a route once: build the map URL (gRouteMapUrl) AND return human text directions.
+// Called during the AI tool loop so the model can read the steps back; map is drawn later.
+static String buildRoute(double fLat, double fLon, double tLat, double tLon, const String& mode, const String& label) {
+  gRouteOk = false;
+  if (!mapKey.length())             return "[no map key set]";
+  if (WiFi.status() != WL_CONNECTED) return "[no wifi]";
   String m = mode.startsWith("walk") ? "walk" : (mode.startsWith("bike") || mode.startsWith("bicycl")) ? "bicycle" : "drive";
   char a[16], b[16], c[16], d[16];
   dtostrf(fLat, 0, 6, a); dtostrf(fLon, 0, 6, b); dtostrf(tLat, 0, 6, c); dtostrf(tLon, 0, 6, d);
   String rurl = String("https://api.geoapify.com/v1/routing?waypoints=") + a + "," + b + "|" + c + "," + d +
-                "&mode=" + m + "&format=geojson&apiKey=" + mapKey;
+                "&mode=" + m + "&details=instruction_details&format=geojson&apiKey=" + mapKey;
   WiFiClientSecure tls; tls.setInsecure();
-  HTTPClient http; http.setTimeout(15000);
-  if (!http.begin(tls, rurl)) { mapMsg("route: begin failed"); return; }
+  HTTPClient http; http.setTimeout(20000);
+  if (!http.begin(tls, rurl)) return "[route: connection failed]";
   http.setUserAgent("RoostOS-Communicator");
   int code = http.GET();
-  if (code != 200) { String eb = http.getString(); http.end(); Serial.printf("[route] http=%d %s\n", code, eb.substring(0, 160).c_str()); mapMsg("route http " + String(code)); return; }
-  String js = http.getString(); http.end();
-  JsonDocument doc;
-  if (deserializeJson(doc, js)) { mapMsg("route: bad json"); return; }
+  if (code != 200) { String eb = http.getString(); http.end(); Serial.printf("[route] http=%d %s\n", code, eb.substring(0, 160).c_str()); return "[route: server error " + String(code) + "]"; }
+  // de-chunk the body straight into PSRAM (cross-country routes are 100-300KB — too big for heap Strings)
+  PsramBufStream sink(1000000);
+  if (!sink.buf) { http.end(); return "[route: out of memory]"; }
+  http.writeToStream(&sink);
+  http.end();
+  Serial.printf("[route] bytes=%u\n", (unsigned)sink.len);
+  if (sink.len < 20) { free(sink.buf); return "[route: empty response]"; }
+  JsonDocument doc(&gPsramAlloc);   // PSRAM-backed document: handles big cross-country responses
+  DeserializationError de = deserializeJson(doc, sink.buf, sink.len);
+  free(sink.buf);
+  if (de) { Serial.printf("[route] json err: %s\n", de.c_str()); return String("[route: parse error ") + de.c_str() + "]"; }
   JsonObject feat = doc["features"][0];
-  if (feat.isNull()) { mapMsg("no route found"); return; }
+  if (feat.isNull()) return "[no route found]";
   double dist = feat["properties"]["distance"] | 0.0;   // meters
   double tsec = feat["properties"]["time"] | 0.0;       // seconds
   std::vector<double> plon, plat;
   String gtype = (const char*)(feat["geometry"]["type"] | "");
   JsonArray coords = feat["geometry"]["coordinates"].as<JsonArray>();
-  if (gtype == "MultiLineString") {
-    for (JsonArray seg : coords)
-      for (JsonArray p : seg) { plon.push_back(p[0] | 0.0); plat.push_back(p[1] | 0.0); }
-  } else {
-    for (JsonArray p : coords) { plon.push_back(p[0] | 0.0); plat.push_back(p[1] | 0.0); }
-  }
-  if (plon.empty()) { mapMsg("no route geometry"); return; }
+  if (gtype == "MultiLineString") { for (JsonArray seg : coords) for (JsonArray p : seg) { plon.push_back(p[0] | 0.0); plat.push_back(p[1] | 0.0); } }
+  else { for (JsonArray p : coords) { plon.push_back(p[0] | 0.0); plat.push_back(p[1] | 0.0); } }
+  if (plon.empty()) return "[no route geometry]";
   int step = plon.size() > 60 ? (int)(plon.size() / 60) : 1;
   String poly; double minLa = 1e9, maxLa = -1e9, minLo = 1e9, maxLo = -1e9;
   auto add = [&](double lo, double la) {
@@ -1678,17 +1717,30 @@ static void showRoute(double fLat, double fLon, double tLat, double tLon, const 
   add(plon.back(), plat.back());
   double cLat = (minLa + maxLa) / 2, cLon = (minLo + maxLo) / 2;
   double span = max(max(1e-4, maxLa - minLa), (maxLo - minLo) * 0.7);
-  int zoom = 12; for (int z = 17; z >= 3; z--) { if (span < (360.0 / (double)(1UL << z)) * 0.7) { zoom = z; break; } }
+  int zoom = 12; for (int z = 17; z >= 3; z--) { if (span < (360.0 / (double)(1UL << z)) * 0.30) { zoom = z; break; } }  // 0.30 = generous margin (whole route with padding)
   char cy[16], cx[16]; dtostrf(cLat, 0, 6, cy); dtostrf(cLon, 0, 6, cx);
-  String surl = String("https://maps.geoapify.com/v1/staticmap?style=osm-bright&width=320&height=224&center=lonlat:") + cx + "," + cy +
-                "&zoom=" + zoom + "&format=jpeg&geometry=polyline:" + poly + ";linecolor:%23ff5a5a;linewidth:4;lineopacity:0.9" +
-                "&marker=lonlat:" + b + "," + a + ";color:%2334e2c0;size:small|lonlat:" + d + "," + c + ";color:%23ff5a5a;size:medium&apiKey=" + mapKey;
+  gRouteMapUrl = String("https://maps.geoapify.com/v1/staticmap?style=osm-bright&width=320&height=224&center=lonlat:") + cx + "," + cy +
+                 "&zoom=" + zoom + "&format=jpeg&geometry=polyline:" + poly + ";linecolor:%23ff5a5a;linewidth:4;lineopacity:0.9" +
+                 "&marker=lonlat:" + b + "," + a + ";color:%2334e2c0;size:small|lonlat:" + d + "," + c + ";color:%23ff5a5a;size:medium&apiKey=" + mapKey;
   int mins = (int)(tsec / 60.0 + 0.5); double miles = dist / 1609.34;
-  char sum[40]; snprintf(sum, sizeof(sum), "%s %.1f mi, %d min", m.c_str(), miles, mins);
-  String lab = (label.length() ? label + " - " : String("")) + sum;
+  char sum[48]; snprintf(sum, sizeof(sum), "%s %.1f mi, %d min", m.c_str(), miles, mins);
+  gRouteLabel = (label.length() ? label + " - " : String("")) + sum;
+  gRouteCaption = sum; gRouteOk = true;
   lastMapLat = cLat; lastMapLon = cLon; lastMapValid = true; saveCfg();
-  fetchStaticMap(surl, lab, sum);
+  // turn-by-turn text (first ~12 steps) for the AI to read back
+  String dirs = String(sum) + (label.length() ? String(" to ") + label : String("")) + ":\n";
+  int n = 0, total = 0;
+  for (JsonObject leg : feat["properties"]["legs"].as<JsonArray>())
+    for (JsonObject stp : leg["steps"].as<JsonArray>()) {
+      total++;
+      const char* t = stp["instruction"]["text"] | "";
+      if (t[0] && n < 12) { dirs += String(++n) + ". " + t + "\n"; }
+    }
+  if (total > n) dirs += "...(" + String(total - n) + " more steps)\n";
+  if (n == 0) dirs += "(turn-by-turn not available; see the map)\n";
+  return dirs;
 }
+static void renderRoute() { if (gRouteOk) fetchStaticMap(gRouteMapUrl, gRouteLabel, gRouteCaption); }
 
 // ============================================================================
 //  Remote terminal shell (TCP :23) — "SSH-style" chat + config from a computer.
@@ -1905,7 +1957,7 @@ static void handleShellLine(String line) {
   addMsg(aiLabel() + ": " + reply, aiColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint(aiLabel() + ": " + reply + "\r\n");
-  if (pendingRoute) { pendingRoute = false; mapChip = true; showRoute(rFromLat, rFromLon, rToLat, rToLon, rMode, rLabel); shellPrint("(route shown on device)\r\n"); }
+  if (pendingRoute) { pendingRoute = false; mapChip = true; renderRoute(); shellPrint("(route shown on device)\r\n"); }
   else if (pendingMap) { pendingMap = false; mapChip = true; showMap(pMapLat, pMapLon, pMapZoom, pMapLabel); shellPrint("(map shown on device)\r\n"); }
   shellPrompt();
 }
