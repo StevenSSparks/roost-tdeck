@@ -15,13 +15,25 @@ Claude over WiFi on a pocket QWERTY device with a real screen. Part of the
   Pick the active one in Settings; only providers you've given a key (or a
   reachable Ollama host) can be selected, and switching **verifies the provider
   answers before activating**.
+- **A real multi-turn conversation, not one-shot Q&A** — the device replays a
+  bounded transcript on every request, so follow-ups, pronouns ("is *it* open?"),
+  and short replies ("no") keep their context. The **`new`** button (or `/clear`)
+  starts a fresh chat and wipes the AI's memory.
+- **An AI that uses tools on its own** — it decides when to **search the live web**
+  (DuckDuckGo, no `/web` needed), **show a place on the map**, or **draw driving/
+  walking/bicycle directions** — e.g. *"where's a good steakhouse in Clayton?"* or
+  *"driving directions from Clayton to Chesterfield"*. A live "thinking…" line shows
+  which tool is running. Toggle tools with `/tools`.
 - Branded **boot splash** (the RoostOS chick-on-antenna).
 - A **categorized Settings menu** (BlackBerry-style): a main page with
   per-category sub-pages — **Apps**, **Display**, **Colors**, **AI Provider**,
   **Device**, **System / About** — each with a Back item.
-- **On-screen maps** 🗺️ — Geoapify static maps rendered on the LCD; center on
-  GPS or any coordinates (`/map <lat> <lon>`). The AI can **show you a map** by
-  calling a `show_map` tool (e.g. *"show me a map of Paris"*).
+- **On-screen maps + routing** 🗺️ — Geoapify static maps rendered on the LCD:
+  center on GPS or any coordinates/place (`/map <lat lon|place>`), **labeled** with
+  the place name and zoomed to street level. The AI drives them via `show_map` and
+  `show_route` (routes auto-fit the view and show distance + time). Maps are
+  **cached**, so the lower-left **`map`** chip reopens the last one instantly.
+  Location falls back **GPS → saved home/zip → IP geolocation → Gateway Arch**.
 - **GPS** (L76K) for location + time; **NTP** time sync so the AI is time-aware.
 - **Games** 🐍 — Snake (trackball/WASD), Sudoku (touch: tap a cell + number pad,
   10 boards), and a Slide 1-11 tile puzzle.
@@ -33,8 +45,11 @@ Claude over WiFi on a pocket QWERTY device with a real screen. Part of the
 - **Personalization**: your name (the AI greets you), timezone, backlight
   brightness, sounds, trackball on/off, and more — all **saved** (survive reboot).
 - Smooth, **adjustable fonts** and **configurable colors**, **scrollback**.
-- Physical QWERTY input; trackball to scroll + navigate. (Touch calibration and
-  real SSH are on the roadmap below.)
+- Physical QWERTY input; trackball to scroll + navigate. **Numbers & symbols**:
+  hold **Alt** and press the key with the number/symbol printed above it (W=1, E=2,
+  S=4, D=5, …), or tap the on-screen **`123`** bar in the chat input.
+- Shells over **USB-C serial, TCP (:23), and real SSH (:22)** all share the same
+  chat + `/command` set.
 
 ## Hardware
 **LILYGO T-Deck Plus** (ESP32-S3, 16 MB flash, 8 MB PSRAM, 2.8" 320×240 ST7789,
@@ -133,14 +148,15 @@ with the on-screen chat. **Just type** to talk to the AI. Commands:
 | | |
 |---|---|
 | **Chat** | `/cls` clear screen · `/history [n]` · `/retry` · `/clear` wipe chat · `/who` · `/time` |
-| **Web** | `/web <query>` — DuckDuckGo search, AI reports the answer |
+| **Web** | `/web <query>` — manual DuckDuckGo search. (The AI also **searches on its own** when a question needs it — no command required.) |
 | **Location** | `/gps` · `/gps stream`\|`stop` · `/map [lat lon\|place]` · `/home <lat lon\|place/zip>` |
-| **AI** | `/provider [name]` (lists/switches) · `/model [name]` · `/tools [name on\|off]` |
+| **AI** | `/provider [name]` (lists/switches) · `/model [name]` · `/tools [name on\|off]` (`show_map`, `show_route`, `web_search`, `get_location`) |
 | **Device** | `/status` · `/about` · `/bat` · `/rssi` · `/ip` · `/reboot` |
 | **Setup** | `/set` (lists options) · `/set <opt> <val>` · `/wizard` (guided) · `/get` |
 | **Keys/WiFi** | `/key anthropic\|openai\|gemini <k>` · `/ollama <host>` · `/wifi <ssid> <pw>` · `/mapkey <k>` |
 | **Personalize** | `/name <you>` · `/prompt roostos\|ai\|os\|<word>` · `/status ip\|demo\|phone` · `/brightness 10-100` |
 | **Apps** | `/snake` · `/sudoku` · `/slide` |
+| **Debug** | `/kbdebug on\|off` then `/kblog` — capture raw physical-keyboard bytes (I2C 0x55) to diagnose the layout |
 | | `/help` lists everything · `/quit` disconnects |
 
 > Typical flow for a fresh board: flash with only your WiFi set, boot, connect

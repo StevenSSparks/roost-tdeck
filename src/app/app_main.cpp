@@ -16,6 +16,7 @@
 #include <TinyGPSPlus.h>
 #include <Preferences.h>
 #include <vector>
+#include <vector>
 #include <functional>
 #include "secrets.h"
 #include "version.h"
@@ -127,7 +128,7 @@ static int     tzOffsetMin = 0;                    // minutes from UTC (e.g. -30
 static int     brightness = 230;                   // 0..255 backlight (LEDC PWM on BL)
 static bool    soundsOn   = true;                  // UI/alert tones (speaker)
 static bool    trackballOn = true;                 // false hides the cursor/roll nav
-static bool    webSearchOn = false;                // allow AI web search (roadmap)
+static bool    webSearchOn = true;                 // let the AI search the web (DuckDuckGo)
 static bool    toolShowMap = true, toolGetLoc = true;   // AI tools the model may call
 static String  promptWord = "roostos";             // shell prompt word (roostos/ai/os/…)
 static bool    remoteShellOn = false;              // TCP shell on port 23
@@ -144,7 +145,19 @@ static String  wifiSsid = "", wifiPass = "";
 // last-known location (from GPS or a manual/AI set); used by the map screen
 static double  locLat = 0, locLon = 0; static bool locValid = false;
 // AI-requested map (set when the model calls the show_map tool; rendered after reply)
-static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0;
+static bool    pendingMap = false; static double pMapLat = 0, pMapLon = 0; static String pMapLabel; static int pMapZoom = 16;
+static bool    mapChip = false;   // AI found a place/route: show a tappable "map" chip instead of auto-opening
+static bool    pendingRoute = false; static double rFromLat = 0, rFromLon = 0, rToLat = 0, rToLon = 0; static String rMode, rLabel;
+static bool    symBar = false;   // on-screen number/symbol row (touch) so you can type digits/symbols for addresses
+static int     gInputY = 0, gInputH = 0;   // input-bar geometry, shared between draw() and touch hit-testing
+static const char kSymRow0[11] = "1234567890";
+static const char kSymRow1[11] = ",.#-/@&: \b";   // 10 keys; ' '=space, '\b'=backspace
+static uint8_t* mapCacheBuf = nullptr; static size_t mapCacheLen = 0; static bool mapCacheValid = false;  // last map JPEG, so reopen is instant + offline
+static String  mapCacheLabel, mapCacheCoord;
+// rolling multi-turn AI chat memory (replayed on every request so it's a conversation, not one-shot)
+struct ChatMsg { String role; String text; };
+static std::vector<ChatMsg> chatHist;
+static const size_t kHistMaxBytes = 2048;          // ~budget for replayed transcript (RAM + tokens)
 // last map shown (persisted) so /map can reopen it without a GPS fix
 static double  lastMapLat = 0, lastMapLon = 0; static bool lastMapValid = false;
 // user-set home location (persisted); a /map fallback when there's no GPS fix
@@ -404,6 +417,7 @@ static void draw() {
   setFont(inputFontIdx);
   int inputH = tft.fontHeight() + 6;
   int inputY = scrH - inputH;
+  gInputY = inputY; gInputH = inputH;
 
   // chat area
   setFont(chatFontIdx);
@@ -435,23 +449,51 @@ static void draw() {
   // input line (own font, amber prompt) + a tappable clear-chat button
   const int cbw = 34;
   tft.fillRect(0, inputY, scrW, inputH, C_PANEL);
+  // map chip (lower-LEFT, before the prompt) — easy to tap; appears when the AI found a place to show
+  int leftX = 2;
+  if (mapChip) {
+    tft.fillRoundRect(2, inputY + 1, cbw - 2, inputH - 2, 3, C_TEAL);
+    tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(C_BG, C_TEAL); tft.drawString("map", 2 + (cbw - 2) / 2, inputY + inputH / 2);
+    tft.setTextDatum(TL_DATUM);
+    leftX = cbw + 2;
+  }
   setFont(inputFontIdx);
-  tft.setTextColor(accentColor, C_PANEL); tft.drawString("> ", 2, inputY + 2);
+  tft.setTextColor(accentColor, C_PANEL); tft.drawString("> ", leftX, inputY + 2);
   int pw = tft.textWidth("> ") + 2;
   tft.setTextColor(C_INK, C_PANEL);
   String shown = input;
-  while (shown.length() && tft.textWidth(shown) > maxW - pw - cbw) shown = shown.substring(1);
-  tft.drawString(shown, 2 + pw, inputY + 2);
-  // clear button (bottom-right)
-  tft.drawRoundRect(scrW - cbw, inputY + 1, cbw - 2, inputH - 2, 3, C_DIM);
+  while (shown.length() && tft.textWidth(shown) > maxW - leftX - pw - 2 * cbw - 4) shown = shown.substring(1);
+  tft.drawString(shown, leftX + pw, inputY + 2);
   tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(C_DIM, C_PANEL); tft.drawString("clr", scrW - cbw / 2 - 1, inputY + inputH / 2);
+  // 123/abc chip (left of 'new') — toggles the on-screen number/symbol row
+  tft.drawRoundRect(scrW - 2 * cbw - 2, inputY + 1, cbw - 2, inputH - 2, 3, C_AMBER);
+  tft.setTextColor(C_AMBER, C_PANEL); tft.drawString(symBar ? "abc" : "123", scrW - cbw - cbw / 2 - 3, inputY + inputH / 2);
+  // new-chat button (bottom-right) — clears the screen AND the AI's memory
+  tft.drawRoundRect(scrW - cbw, inputY + 1, cbw - 2, inputH - 2, 3, C_TEAL);
+  tft.setTextColor(C_TEAL, C_PANEL); tft.drawString("new", scrW - cbw / 2 - 1, inputY + inputH / 2);
+  // on-screen number/symbol bar (two touch rows just above the input line)
+  if (symBar) {
+    int rowH = 20, barTop = inputY - 2 * rowH;
+    tft.fillRect(0, barTop, scrW, 2 * rowH, C_PANEL);
+    for (int r = 0; r < 2; r++) {
+      const char* row = r == 0 ? kSymRow0 : kSymRow1;
+      for (int c = 0; c < 10; c++) {
+        int x = c * (scrW / 10), y = barTop + r * rowH, w = scrW / 10;
+        tft.drawRect(x, y, w, rowH, C_DIM);
+        char ch = row[c];
+        String lab = ch == ' ' ? String("sp") : ch == '\b' ? String("<x") : String(ch);
+        tft.setTextColor(C_INK, C_PANEL); tft.drawString(lab, x + w / 2, y + rowH / 2);
+      }
+    }
+  }
   tft.setTextDatum(TL_DATUM);
 }
 
 static void clearChat() {
-  msgs.clear(); scrollLines = 0; input = "";
+  msgs.clear(); scrollLines = 0; input = ""; chatHist.clear(); mapChip = false;   // wipe screen AND the AI's memory: fresh conversation
   addMsg("Ready to Roost! Type a message + Enter, or tap the menu.", C_TEAL);
+  addMsg("tip: hold Alt for numbers/symbols, or tap 123.", C_DIM);
   draw();
 }
 
@@ -463,7 +505,10 @@ static String defaultModel(const String& p);
 static bool joinWifi(const String& ssid, const String& pass);
 static String activeSsid();
 static void draw();
-static void showMap(double lat, double lon, int zoom);
+static void showMap(double lat, double lon, int zoom, const String& label = "");
+static void showRoute(double fLat, double fLon, double tLat, double tLon, const String& mode, const String& label);
+static String ddgSearch(const String& q);
+static bool geocodePlace(const String& q, double& lat, double& lon);
 static void gameLaunch(int which);
 static void startCalibration();
 void sshRegenHostKey();
@@ -833,7 +878,59 @@ static String buildSysPrompt() {
     char buf[40]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tmv);
     s += " Current local date/time: "; s += buf; s += ".";
   }
+  s += " This is an ongoing conversation: earlier messages are included, so use them for "
+       "context and follow-ups (pronouns like 'it'/'there', short replies like 'no').";
+  if (webSearchOn)
+    s += " For places, businesses, addresses, prices, or anything current, call web_search FIRST "
+         "to get real facts and an address - do not guess. When you have a specific place, call "
+         "show_map with its lat/lon and a short label (the place name) to show it on screen. "
+         "For directions or 'how do I get to X', call show_route with the destination lat/lon, a "
+         "label, and mode (drive/walk/bicycle); it uses the device location as the start.";
   return s;
+}
+
+// ---- rolling chat memory ----
+static void histAdd(const char* role, const String& text) {
+  if (!text.length()) return;
+  chatHist.push_back(ChatMsg{ String(role), text });
+  size_t total = 0; for (auto& m : chatHist) total += m.text.length();
+  while (total > kHistMaxBytes && chatHist.size() > 2) {   // drop oldest, keep at least one exchange
+    total -= chatHist.front().text.length();
+    chatHist.erase(chatHist.begin());
+  }
+}
+// Record a completed turn (skip error/status strings, which start with '[') and return the reply.
+static String histFinish(const String& prompt, const String& reply) {
+  if (reply.length() && reply[0] != '[') { histAdd("user", prompt); histAdd("assistant", reply); }
+  return reply;
+}
+
+// ---- location resolver: GPS -> saved home/zip -> IP geolocation -> Gateway Arch ----
+static const double kArchLat = 38.6247, kArchLon = -90.1848;   // Gateway Arch, St. Louis (system default)
+static bool ipGeolocate(double& la, double& lo) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http; http.setTimeout(6000);
+  if (!http.begin("http://ip-api.com/json/?fields=status,lat,lon")) return false;
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String p = http.getString(); http.end();
+  JsonDocument d;
+  if (deserializeJson(d, p)) return false;
+  if (String((const char*)(d["status"] | "")) != "success") return false;
+  la = d["lat"] | 0.0; lo = d["lon"] | 0.0;
+  return la != 0.0 || lo != 0.0;
+}
+static void resolveLocation(double& la, double& lo, String& src) {
+  if (locValid)              { la = locLat;  lo = locLon;  src = "gps";  return; }
+  if (homeValid)             { la = homeLat; lo = homeLon; src = "home"; return; }
+  if (ipGeolocate(la, lo))   { src = "approx (ip)"; return; }
+  la = kArchLat; lo = kArchLon; src = "default (Gateway Arch, St. Louis)";
+}
+
+// Live progress note while the AI works (updates the chat "thinking" bubble + serial log).
+static void aiNote(const String& s) {
+  if (uiMode == MODE_CHAT && !msgs.empty()) { msgs.back().text = ". " + s; draw(); }
+  Serial.println("[ai] " + s);
 }
 
 // Ask the currently-selected AI provider. Returns reply text (or an "[error] ..." string).
@@ -846,22 +943,44 @@ static String askAI(const String& prompt) {
     if (!kAnthropic.length()) return "[no Anthropic key — set via /key anthropic <key>]";
     JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 500; req["system"] = sp;
     JsonArray msgs_ = req["messages"].to<JsonArray>();
+    for (auto& h : chatHist) { JsonObject m = msgs_.add<JsonObject>(); m["role"] = h.role; m["content"] = h.text; }
     { JsonObject m = msgs_.add<JsonObject>(); m["role"] = "user"; m["content"] = prompt; }
     // tools the model may call (each individually toggleable via /tools)
     JsonArray tools = req["tools"].to<JsonArray>();
     if (toolShowMap) { JsonObject t = tools.add<JsonObject>();
-      t["name"] = "show_map"; t["description"] = "Display a map on the device screen centered at a latitude/longitude. Use your own knowledge of place coordinates.";
+      t["name"] = "show_map"; t["description"] = "Display a map on the device screen at a latitude/longitude, tagged with a label. Call this after finding a place (via web_search or your own knowledge). Always pass a specific street-level lat/lon and a label.";
       JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
       JsonObject pr = sc["properties"].to<JsonObject>();
       pr["lat"]["type"] = "number"; pr["lon"]["type"] = "number";
-      JsonArray rq = sc["required"].to<JsonArray>(); rq.add("lat"); rq.add("lon"); }
+      pr["label"]["type"] = "string"; pr["label"]["description"] = "short name of the place shown, e.g. 'Wright's Tavern'";
+      pr["zoom"]["type"] = "integer"; pr["zoom"]["description"] = "map zoom 1-19: use 16 for a single business/address, 13 for a neighborhood, 11 for a city, 9 for a region";
+      JsonArray rq = sc["required"].to<JsonArray>(); rq.add("lat"); rq.add("lon"); rq.add("label"); }
+    if (toolShowMap) { JsonObject t = tools.add<JsonObject>();
+      t["name"] = "show_route"; t["description"] = "Draw walking/driving/bicycle directions on the device map. Prefer passing place names/addresses/zips as to_place and from_place (the device geocodes them). If from_place is omitted, the device's current location is the start.";
+      JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
+      JsonObject pr = sc["properties"].to<JsonObject>();
+      pr["to_place"]["type"] = "string"; pr["to_place"]["description"] = "destination place/address/zip, e.g. 'Chesterfield, MO' or '63043'";
+      pr["from_place"]["type"] = "string"; pr["from_place"]["description"] = "origin place/address/zip (omit to start from the device's location)";
+      pr["mode"]["type"] = "string"; pr["mode"]["description"] = "drive | walk | bicycle";
+      pr["to_lat"]["type"] = "number"; pr["to_lon"]["type"] = "number"; pr["from_lat"]["type"] = "number"; pr["from_lon"]["type"] = "number";
+      JsonArray rq = sc["required"].to<JsonArray>(); rq.add("to_place"); rq.add("mode"); }
     if (toolGetLoc) { JsonObject t = tools.add<JsonObject>();
       t["name"] = "get_location"; t["description"] = "Get the device's current GPS latitude/longitude.";
       JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object"; sc["properties"].to<JsonObject>(); }
-    for (int round = 0; round < 3; round++) {
+    if (webSearchOn) { JsonObject t = tools.add<JsonObject>();
+      t["name"] = "web_search"; t["description"] = "Search the live web (DuckDuckGo) for current info: places, businesses, addresses, hours, prices, news. Use this before answering anything location-specific or time-sensitive; don't guess.";
+      JsonObject sc = t["input_schema"].to<JsonObject>(); sc["type"] = "object";
+      sc["properties"]["query"]["type"] = "string"; sc["properties"]["query"]["description"] = "search terms";
+      JsonArray rq = sc["required"].to<JsonArray>(); rq.add("query"); }
+    for (int round = 0; round < 6; round++) {   // allow multi-step: web_search -> show_map -> summarize
       String body; serializeJson(req, body);
       p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
                        "x-api-key", kAnthropic.c_str(), "anthropic-version", "2023-06-01", err);
+      if (p == "") {   // weak WiFi: one retry before giving up
+        aiNote("network slow, retrying...");
+        p = httpPostJSON(true, "https://api.anthropic.com/v1/messages", body,
+                         "x-api-key", kAnthropic.c_str(), "anthropic-version", "2023-06-01", err);
+      }
       if (p == "") return "[error] " + err;
       if (deserializeJson(r, p)) return "[bad JSON]";
       if (r["type"] == "error") return String("[api] ") + (const char*)(r["error"]["message"] | "");
@@ -876,13 +995,31 @@ static String askAI(const String& prompt) {
         else if (type == "tool_use") {
           cc["type"] = "tool_use"; cc["id"] = (const char*)b["id"]; cc["name"] = (const char*)b["name"]; cc["input"] = b["input"];
           String name = (const char*)(b["name"] | ""), res;
-          if (name == "show_map") { pMapLat = b["input"]["lat"] | 0.0; pMapLon = b["input"]["lon"] | 0.0; pendingMap = true; res = "map displayed on device"; }
-          else if (name == "get_location") { res = locValid ? String(locLat, 5) + "," + String(locLon, 5) : "no GPS fix"; }
+          if (name == "show_map") { pMapLat = b["input"]["lat"] | 0.0; pMapLon = b["input"]["lon"] | 0.0; pMapLabel = (const char*)(b["input"]["label"] | ""); pMapZoom = b["input"]["zoom"] | 16; if (pMapZoom < 1 || pMapZoom > 19) pMapZoom = 16; aiNote("mapping " + (pMapLabel.length() ? pMapLabel : String("location")) + "..."); pendingMap = true; res = "map displayed on device"; }
+          else if (name == "show_route") {
+            String toPlace = (const char*)(b["input"]["to_place"] | "");
+            String fromPlace = (const char*)(b["input"]["from_place"] | "");
+            rMode = (const char*)(b["input"]["mode"] | "drive");
+            rLabel = toPlace.length() ? toPlace : String((const char*)(b["input"]["to_label"] | ""));
+            // destination
+            bool okTo = false;
+            if (!b["input"]["to_lat"].isNull()) { rToLat = b["input"]["to_lat"] | 0.0; rToLon = b["input"]["to_lon"] | 0.0; okTo = true; }
+            else if (toPlace.length()) { aiNote("finding " + toPlace + "..."); okTo = geocodePlace(toPlace, rToLat, rToLon); }
+            // origin
+            String src;
+            if (!b["input"]["from_lat"].isNull()) { rFromLat = b["input"]["from_lat"] | 0.0; rFromLon = b["input"]["from_lon"] | 0.0; }
+            else if (fromPlace.length()) { aiNote("finding " + fromPlace + "..."); if (!geocodePlace(fromPlace, rFromLat, rFromLon)) resolveLocation(rFromLat, rFromLon, src); }
+            else resolveLocation(rFromLat, rFromLon, src);
+            if (!okTo) { res = "could not find destination '" + toPlace + "'"; }
+            else { aiNote("routing " + rMode + " to " + rLabel + "..."); pendingRoute = true; res = "route displayed on device"; }
+          }
+          else if (name == "get_location") { aiNote("getting your location..."); double la, lo; String src; resolveLocation(la, lo, src); res = String(la, 5) + "," + String(lo, 5) + " (" + src + ")"; }
+          else if (name == "web_search") { String q = (const char*)(b["input"]["query"] | ""); aiNote("searching the web: " + q); res = ddgSearch(q); if (!res.length()) res = "(no results found)"; }
           else res = "unknown tool";
           tuId.push_back((const char*)(b["id"] | "")); tuRes.push_back(res);
         }
       }
-      if (tuId.empty()) return text.length() ? text : "[no text]";   // done, no tool call
+      if (tuId.empty()) return histFinish(prompt, text.length() ? text : "[no text]");   // done, no tool call
       JsonObject ur = msgs_.add<JsonObject>(); ur["role"] = "user";
       JsonArray urc = ur["content"].to<JsonArray>();
       for (size_t i = 0; i < tuId.size(); i++) {
@@ -896,6 +1033,7 @@ static String askAI(const String& prompt) {
     JsonDocument req; req["model"] = aiModel; req["max_tokens"] = 400;
     JsonArray a = req["messages"].to<JsonArray>();
     JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = sp;
+    for (auto& h : chatHist) { JsonObject m = a.add<JsonObject>(); m["role"] = h.role; m["content"] = h.text; }
     JsonObject u = a.add<JsonObject>(); u["role"] = "user"; u["content"] = prompt;
     String body; serializeJson(req, body);
     String auth = String("Bearer ") + kOpenAI;
@@ -904,13 +1042,15 @@ static String askAI(const String& prompt) {
     if (p == "") return "[error] " + err;
     if (deserializeJson(r, p)) return "[bad JSON]";
     if (r["error"]) return String("[api] ") + (const char*)(r["error"]["message"] | "");
-    return String((const char*)(r["choices"][0]["message"]["content"] | "[no text]"));
+    return histFinish(prompt, String((const char*)(r["choices"][0]["message"]["content"] | "[no text]")));
   }
   if (aiProvider == "gemini") {
     if (!kGemini.length()) return "[no Gemini key — set via /key gemini <key>]";
     JsonDocument req;
     req["systemInstruction"]["parts"][0]["text"] = sp;
-    JsonObject u = req["contents"].to<JsonArray>().add<JsonObject>();
+    JsonArray contents = req["contents"].to<JsonArray>();
+    for (auto& h : chatHist) { JsonObject m = contents.add<JsonObject>(); m["role"] = (h.role == "assistant" ? "model" : "user"); m["parts"][0]["text"] = h.text; }
+    JsonObject u = contents.add<JsonObject>();
     u["role"] = "user"; u["parts"][0]["text"] = prompt;
     req["generationConfig"]["maxOutputTokens"] = 400;
     String body; serializeJson(req, body);
@@ -920,20 +1060,21 @@ static String askAI(const String& prompt) {
     if (p == "") return "[error] " + err;
     if (deserializeJson(r, p)) return "[bad JSON]";
     if (r["error"]) return String("[api] ") + (const char*)(r["error"]["message"] | "");
-    return String((const char*)(r["candidates"][0]["content"]["parts"][0]["text"] | "[no text]"));
+    return histFinish(prompt, String((const char*)(r["candidates"][0]["content"]["parts"][0]["text"] | "[no text]")));
   }
   if (aiProvider == "ollama") {
     if (!ollamaHost.length()) return "[set Ollama host via /ollama <host:port>]";
     JsonDocument req; req["model"] = aiModel; req["stream"] = false;
     JsonArray a = req["messages"].to<JsonArray>();
     JsonObject s = a.add<JsonObject>(); s["role"] = "system"; s["content"] = sp;
+    for (auto& h : chatHist) { JsonObject m = a.add<JsonObject>(); m["role"] = h.role; m["content"] = h.text; }
     JsonObject u = a.add<JsonObject>(); u["role"] = "user"; u["content"] = prompt;
     String body; serializeJson(req, body);
     p = httpPostJSON(false, String("http://") + ollamaHost + "/api/chat", body,
                      nullptr, nullptr, nullptr, nullptr, err);
     if (p == "") return "[error] " + err;
     if (deserializeJson(r, p)) return "[bad JSON]";
-    return String((const char*)(r["message"]["content"] | "[no text]"));
+    return histFinish(prompt, String((const char*)(r["message"]["content"] | "[no text]")));
   }
   return "[unknown provider: " + aiProvider + "]";
 }
@@ -960,14 +1101,17 @@ static String deMarkdown(String s) {
 }
 
 static void sendPrompt(const String& prompt) {
-  scrollLines = 0;
+  scrollLines = 0;   // mapChip persists across the conversation (reopens the last address); cleared only on new chat
   String lbl = aiLabel() + ": ";
   addMsg(youLabel + ": " + prompt, userColor);
-  addMsg("...", C_DIM); draw();
+  addMsg(". thinking...", C_DIM); draw();
   String reply = deMarkdown(askAI(prompt));
   Serial.println(lbl + reply);
   if (!msgs.empty()) msgs.pop_back();       // remove "..."
   addMsg(lbl + reply, aiColor);
+  bool openMapNow = pendingMap, openRouteNow = pendingRoute;   // did THIS turn produce a map/route?
+  if (pendingMap || pendingRoute) mapChip = true;              // enable the reopenable 'map' chip (lower-left)
+  pendingMap = false; pendingRoute = false;
   // show YOUR message at the top of the new exchange (scroll down for long replies)
   setFont(chatFontIdx);
   std::vector<String> ex;
@@ -975,12 +1119,24 @@ static void sendPrompt(const String& prompt) {
   wrapMsg(lbl + reply, scrW - 4, ex);
   scrollLines = (int)ex.size() > lastRows ? (int)ex.size() - lastRows : 0;
   draw();
-  if (pendingMap) { pendingMap = false; showMap(pMapLat, pMapLon, 13); }   // AI asked for a map
+  if (openRouteNow)     showRoute(rFromLat, rFromLon, rToLat, rToLon, rMode, rLabel);   // auto-open; chip stays for reopen
+  else if (openMapNow)  showMap(pMapLat, pMapLon, pMapZoom, pMapLabel);
 }
 
+static bool kbDebug = false;   // /kbdebug on -> log every raw keyboard byte
+static String kbLog;           // ring buffer of captured bytes (dump with /kblog)
 static uint8_t readKey() {
   Wire.requestFrom(KB_ADDR, 1);
-  if (Wire.available()) return Wire.read();
+  if (Wire.available()) {
+    uint8_t b = Wire.read();
+    if (kbDebug && b) {
+      Serial.printf("[kb] 0x%02X (%d) '%c'\n", b, b, (b >= 32 && b < 127) ? (char)b : '.');
+      char tmp[20]; snprintf(tmp, sizeof(tmp), "%02X(%c) ", b, (b >= 32 && b < 127) ? (char)b : '.');
+      kbLog += tmp;
+      if (kbLog.length() > 600) kbLog.remove(0, kbLog.length() - 600);
+    }
+    return b;
+  }
   return 0;
 }
 
@@ -1171,6 +1327,7 @@ void setup() {
   addMsg(WiFi.status() == WL_CONNECTED
     ? String("Ready to Roost! Type a message + Enter, or tap the menu.")
     : String("WiFi failed - check SSS-FAMILY"), C_TEAL);
+  addMsg("tip: hold Alt for numbers/symbols, or tap 123.", C_DIM);
   chatFontIdx = save;                         // swap to preferred size
   if (WiFi.status() == WL_CONNECTED)
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");   // UTC; tz applied in buildSysPrompt
@@ -1415,7 +1572,55 @@ static void mapMsg(const String& m) {
   tft.setTextColor(C_INK, C_BG); tft.drawString(m, 8, 70);
   tft.setTextColor(C_DIM, C_BG); tft.drawString("any key = back to chat", 8, scrH - 12);
 }
-static void showMap(double lat, double lon, int zoom) {
+// Redraw the map from the cached JPEG (instant, no network) — used to reopen the last map.
+static void renderMap() {
+  if (!mapCacheValid || !mapCacheBuf) return;
+  uiMode = MODE_MAP;
+  tft.fillScreen(C_BG);
+  TJpgDec.drawJpg(0, 8, mapCacheBuf, mapCacheLen);
+  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
+  if (mapCacheLabel.length()) {
+    String lab = mapCacheLabel; if (lab.length() > 40) lab = lab.substring(0, 39) + ".";
+    int tw = tft.textWidth(lab) + 12;
+    tft.fillRoundRect(2, 2, min(tw, scrW - 4), 14, 3, C_TEAL);
+    tft.setTextColor(C_BG, C_TEAL); tft.drawString(lab, 8, 5);
+  }
+  tft.setTextColor(C_AMBER, C_BG); tft.drawString(mapCacheCoord, 4, scrH - 11);
+  tft.setTextColor(C_DIM, C_BG); tft.drawString("key/click/tap = close", scrW - 118, scrH - 11);
+}
+// Fetch a Geoapify static-map JPEG from any URL, cache it, and draw it. Returns success.
+static bool fetchStaticMap(const String& url, const String& label, const String& caption) {
+  { int ki = url.indexOf("&apiKey="); Serial.printf("[map] url: %s\n", (ki > 0 ? url.substring(0, ki) + "&apiKey=***" : url).c_str()); }  // verifiable, key redacted
+  WiFiClientSecure tls; tls.setInsecure();
+  HTTPClient http; http.setTimeout(15000);
+  if (!http.begin(tls, url)) { mapMsg("map: begin failed"); return false; }
+  http.setUserAgent("RoostOS-Communicator");
+  int code = http.GET();
+  Serial.printf("[map] http=%d\n", code);
+  if (code != 200) {
+    String eb = http.getString(); http.end();
+    Serial.printf("[map] err body: %s\n", eb.substring(0, 200).c_str());
+    mapMsg("map http " + String(code) + " (see serial)"); return false;
+  }
+  int len = http.getSize();
+  size_t cap = (len > 0) ? (size_t)len + 16 : 220000;
+  uint8_t* buf = (uint8_t*)ps_malloc(cap);
+  if (!buf) { http.end(); mapMsg("map: out of PSRAM"); return false; }
+  WiFiClient* st = http.getStreamPtr(); size_t got = 0; uint32_t t0 = millis();
+  while (http.connected() && (len < 0 || got < (size_t)len) && got < cap && millis() - t0 < 15000) {
+    size_t avail = st->available();
+    if (avail) { int r = st->readBytes(buf + got, min(avail, cap - got)); if (r > 0) { got += r; t0 = millis(); } }
+    else delay(5);
+  }
+  http.end();
+  Serial.printf("[map] jpeg bytes=%u\n", (unsigned)got);
+  if (mapCacheBuf) free(mapCacheBuf);
+  mapCacheBuf = buf; mapCacheLen = got; mapCacheValid = true;
+  mapCacheLabel = label; mapCacheCoord = caption;
+  renderMap();
+  return true;
+}
+static void showMap(double lat, double lon, int zoom, const String& label) {
   uiMode = MODE_MAP;
   if (!mapKey.length())            { mapMsg("No map key. Set one:  /mapkey <key>"); return; }
   if (WiFi.status() != WL_CONNECTED){ mapMsg("Map needs WiFi."); return; }
@@ -1425,38 +1630,64 @@ static void showMap(double lat, double lon, int zoom) {
                       "&width=320&height=224&center=lonlat:") + clon + "," + clat +
                "&zoom=" + zoom + "&format=jpeg&marker=lonlat:" + clon + "," + clat +
                ";color:%2334e2c0;size:medium&apiKey=" + mapKey;
+  lastMapLat = lat; lastMapLon = lon; lastMapValid = true; saveCfg();
+  fetchStaticMap(url, label, String(clat) + "," + clon + (locValid ? " (gps)" : ""));
+}
+// Route (fLat,fLon)->(tLat,tLon) by mode ("drive"/"walk"/"bicycle"): draw the line + endpoints, auto-fit.
+static void showRoute(double fLat, double fLon, double tLat, double tLon, const String& mode, const String& label) {
+  uiMode = MODE_MAP;
+  if (!mapKey.length())            { mapMsg("No map key. Set one:  /mapkey <key>"); return; }
+  if (WiFi.status() != WL_CONNECTED){ mapMsg("Map needs WiFi."); return; }
+  mapMsg("Finding route...");
+  String m = mode.startsWith("walk") ? "walk" : (mode.startsWith("bike") || mode.startsWith("bicycl")) ? "bicycle" : "drive";
+  char a[16], b[16], c[16], d[16];
+  dtostrf(fLat, 0, 6, a); dtostrf(fLon, 0, 6, b); dtostrf(tLat, 0, 6, c); dtostrf(tLon, 0, 6, d);
+  String rurl = String("https://api.geoapify.com/v1/routing?waypoints=") + a + "," + b + "|" + c + "," + d +
+                "&mode=" + m + "&format=geojson&apiKey=" + mapKey;
   WiFiClientSecure tls; tls.setInsecure();
   HTTPClient http; http.setTimeout(15000);
-  if (!http.begin(tls, url)) { mapMsg("map: begin failed"); return; }
+  if (!http.begin(tls, rurl)) { mapMsg("route: begin failed"); return; }
   http.setUserAgent("RoostOS-Communicator");
   int code = http.GET();
-  Serial.printf("[map] http=%d keylen=%d\n", code, (int)mapKey.length());   // key intentionally not logged
-  if (code != 200) {
-    String eb = http.getString(); http.end();
-    Serial.printf("[map] err body: %s\n", eb.substring(0, 160).c_str());
-    mapMsg("map http " + String(code) + " (see serial)"); return;
+  if (code != 200) { String eb = http.getString(); http.end(); Serial.printf("[route] http=%d %s\n", code, eb.substring(0, 160).c_str()); mapMsg("route http " + String(code)); return; }
+  String js = http.getString(); http.end();
+  JsonDocument doc;
+  if (deserializeJson(doc, js)) { mapMsg("route: bad json"); return; }
+  JsonObject feat = doc["features"][0];
+  if (feat.isNull()) { mapMsg("no route found"); return; }
+  double dist = feat["properties"]["distance"] | 0.0;   // meters
+  double tsec = feat["properties"]["time"] | 0.0;       // seconds
+  std::vector<double> plon, plat;
+  String gtype = (const char*)(feat["geometry"]["type"] | "");
+  JsonArray coords = feat["geometry"]["coordinates"].as<JsonArray>();
+  if (gtype == "MultiLineString") {
+    for (JsonArray seg : coords)
+      for (JsonArray p : seg) { plon.push_back(p[0] | 0.0); plat.push_back(p[1] | 0.0); }
+  } else {
+    for (JsonArray p : coords) { plon.push_back(p[0] | 0.0); plat.push_back(p[1] | 0.0); }
   }
-  int len = http.getSize();
-  size_t cap = (len > 0) ? (size_t)len + 16 : 220000;
-  uint8_t* buf = (uint8_t*)ps_malloc(cap);
-  if (!buf) { http.end(); mapMsg("map: out of PSRAM"); return; }
-  WiFiClient* st = http.getStreamPtr(); size_t got = 0; uint32_t t0 = millis();
-  while (http.connected() && (len < 0 || got < (size_t)len) && got < cap && millis() - t0 < 15000) {
-    size_t avail = st->available();
-    if (avail) { int r = st->readBytes(buf + got, min(avail, cap - got)); if (r > 0) { got += r; t0 = millis(); } }
-    else delay(5);
-  }
-  http.end();
-  tft.fillScreen(C_BG);
-  TJpgDec.drawJpg(0, 8, buf, got);
-  free(buf);
-  // remember this location so /map can reopen it without a fix
-  lastMapLat = lat; lastMapLon = lon; lastMapValid = true; saveCfg();
-  tft.setTextFont(1); tft.setTextSize(1); tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(C_AMBER, C_BG);
-  tft.drawString(String(clat) + "," + clon + (locValid ? " (gps)" : ""), 4, scrH - 11);
-  tft.setTextColor(C_DIM, C_BG);
-  tft.drawString("key/click/tap = close", scrW - 118, scrH - 11);
+  if (plon.empty()) { mapMsg("no route geometry"); return; }
+  int step = plon.size() > 60 ? (int)(plon.size() / 60) : 1;
+  String poly; double minLa = 1e9, maxLa = -1e9, minLo = 1e9, maxLo = -1e9;
+  auto add = [&](double lo, double la) {
+    if (poly.length()) poly += ",";
+    char x[16], y[16]; dtostrf(lo, 0, 5, x); dtostrf(la, 0, 5, y); poly += String(x) + "," + y;
+    if (la < minLa) minLa = la; if (la > maxLa) maxLa = la; if (lo < minLo) minLo = lo; if (lo > maxLo) maxLo = lo;
+  };
+  for (size_t i = 0; i < plon.size(); i += step) add(plon[i], plat[i]);
+  add(plon.back(), plat.back());
+  double cLat = (minLa + maxLa) / 2, cLon = (minLo + maxLo) / 2;
+  double span = max(max(1e-4, maxLa - minLa), (maxLo - minLo) * 0.7);
+  int zoom = 12; for (int z = 17; z >= 3; z--) { if (span < (360.0 / (double)(1UL << z)) * 0.7) { zoom = z; break; } }
+  char cy[16], cx[16]; dtostrf(cLat, 0, 6, cy); dtostrf(cLon, 0, 6, cx);
+  String surl = String("https://maps.geoapify.com/v1/staticmap?style=osm-bright&width=320&height=224&center=lonlat:") + cx + "," + cy +
+                "&zoom=" + zoom + "&format=jpeg&geometry=polyline:" + poly + ";linecolor:%23ff5a5a;linewidth:4;lineopacity:0.9" +
+                "&marker=lonlat:" + b + "," + a + ";color:%2334e2c0;size:small|lonlat:" + d + "," + c + ";color:%23ff5a5a;size:medium&apiKey=" + mapKey;
+  int mins = (int)(tsec / 60.0 + 0.5); double miles = dist / 1609.34;
+  char sum[40]; snprintf(sum, sizeof(sum), "%s %.1f mi, %d min", m.c_str(), miles, mins);
+  String lab = (label.length() ? label + " - " : String("")) + sum;
+  lastMapLat = cLat; lastMapLon = cLon; lastMapValid = true; saveCfg();
+  fetchStaticMap(surl, lab, sum);
 }
 
 // ============================================================================
@@ -1586,16 +1817,25 @@ static void handleShellLine(String line) {
     shellPrompt(); return;
   }
   if (line.startsWith("/status ")) { String r = applyCfgCmd(line.substring(1)); shellPrint(r + "\r\n"); shellPrompt(); return; }
+  if (line == "/kbdebug" || line.startsWith("/kbdebug ")) {   // log raw physical-keyboard bytes to serial
+    String v = line.length() > 8 ? line.substring(9) : String(""); v.trim();
+    kbDebug = (v == "on" || v == "1" || v == "");
+    if (kbDebug) kbLog = "";
+    shellPrint(String("keyboard debug: ") + (kbDebug ? "on - now press keys on the T-Deck, then run /kblog" : "off") + "\r\n"); shellPrompt(); return;
+  }
+  if (line == "/kblog") { shellPrint(String("captured keys: ") + (kbLog.length() ? kbLog : String("(none - run /kbdebug on, then press keys)")) + "\r\n"); shellPrompt(); return; }
   if (line == "/tools" || line.startsWith("/tools ")) {
     String a = line.length() > 6 ? line.substring(7) : String(""); a.trim();
-    if (!a.length()) { shellPrint(String("AI tools:\r\n  show_map    ") + (toolShowMap ? "on" : "off") +
+    if (!a.length()) { shellPrint(String("AI tools:\r\n  show_map     ") + (toolShowMap ? "on" : "off") +
                                   "\r\n  get_location " + (toolGetLoc ? "on" : "off") +
+                                  "\r\n  web_search   " + (webSearchOn ? "on" : "off") +
                                   "\r\n(toggle: /tools <name> on|off)\r\n"); shellPrompt(); return; }
     int sp = a.indexOf(' '); String nm = sp < 0 ? a : a.substring(0, sp); String v = sp < 0 ? "" : a.substring(sp + 1); v.trim();
     bool on = (v == "on" || v == "1" || v == "");
     if (nm.startsWith("show") || nm == "map") toolShowMap = on;
     else if (nm.startsWith("get") || nm == "location" || nm == "loc" || nm == "gps") toolGetLoc = on;
-    else { shellPrint("tools: show_map | get_location\r\n"); shellPrompt(); return; }
+    else if (nm.startsWith("web") || nm == "search") webSearchOn = on;
+    else { shellPrint("tools: show_map | get_location | web_search\r\n"); shellPrompt(); return; }
     saveCfg(); shellPrint("tool " + nm + ": " + (on ? "on" : "off") + "\r\n"); shellPrompt(); return;
   }
   if (line == "/web" || line.startsWith("/web ")) {
@@ -1665,7 +1905,8 @@ static void handleShellLine(String line) {
   addMsg(aiLabel() + ": " + reply, aiColor);
   if (uiMode == MODE_CHAT) { scrollLines = 0; draw(); }
   shellPrint(aiLabel() + ": " + reply + "\r\n");
-  if (pendingMap) { pendingMap = false; showMap(pMapLat, pMapLon, 13); shellPrint("(map shown on device)\r\n"); }
+  if (pendingRoute) { pendingRoute = false; mapChip = true; showRoute(rFromLat, rFromLon, rToLat, rToLon, rMode, rLabel); shellPrint("(route shown on device)\r\n"); }
+  else if (pendingMap) { pendingMap = false; mapChip = true; showMap(pMapLat, pMapLon, pMapZoom, pMapLabel); shellPrint("(map shown on device)\r\n"); }
   shellPrompt();
 }
 static void pollShell() {
@@ -2020,8 +2261,19 @@ void loop() {
       int sx, sy; gtMap(tRX, tRY, sx, sy);
       Serial.printf("[touch] raw=%d,%d screen=%d,%d mode=%d\n", tRX, tRY, sx, sy, uiMode);
       if (uiMode == MODE_CHAT) {
-        if (sy < 40) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // tap top ~40px = menu
-        else if (sx > scrW - 36 && sy > scrH - 26) clearChat();   // bottom-right = clear chat
+        int barTop = gInputY - 40;   // on-screen sym rows sit just above the input bar
+        if (symBar && sy >= barTop && sy < gInputY) {          // tapped a key on the number/symbol bar
+          int col = sx / (scrW / 10); if (col > 9) col = 9;
+          int rr = (sy - barTop) / 20; if (rr > 1) rr = 1;
+          char ch = (rr == 0 ? kSymRow0 : kSymRow1)[col];
+          if (ch == '\b') { if (input.length()) input.remove(input.length() - 1); }
+          else input += ch;
+          draw();
+        }
+        else if (sy < 40) { setPage = PG_MAIN; uiMode = MODE_SETTINGS; selIdx = 0; drawSettings(); }  // tap top ~40px = menu
+        else if (sx > scrW - 36 && sy > gInputY) clearChat();                                          // bottom-right = new chat
+        else if (sx > scrW - 72 && sx <= scrW - 36 && sy > gInputY) { symBar = !symBar; draw(); }      // 123/abc = toggle sym bar
+        else if (mapChip && sx < 36 && sy > gInputY) { if (mapCacheValid) renderMap(); else showMap(pMapLat, pMapLon, pMapZoom, pMapLabel); }  // lower-left 'map' chip = reopen
       } else if (uiMode == MODE_MAP) {
         uiMode = MODE_CHAT; draw();                 // tap anywhere closes the map
       } else if (uiMode == MODE_GAME) {
